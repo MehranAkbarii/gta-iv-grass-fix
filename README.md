@@ -573,10 +573,10 @@ ConeFullAngle=75
 ConeReleasePerUpdate=384
 ; How far ahead (milliseconds) the cone follows a turning camera. 0..1000.
 ConeTurnLeadMs=300
-
+```
 Exact option names may depend on the final configuration parser used by
 the build.
-```
+
 ------------------------------------------------------------------------
 
 # 20. Expected Result
