@@ -508,7 +508,6 @@ overhaul.
    or ConeBack, or lower ConeBack to 0 to switch it off.
 
 INI KEYS (section [ProceduralPool]) 
---------------------------------------------------------
 ```ini
 GeneratorMatrixLimit=4096     0 off, else 513..4096
 GeneratorMatrixPool=0         0 automatic, else 7000..65536
