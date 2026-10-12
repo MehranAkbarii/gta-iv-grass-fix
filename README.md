@@ -464,9 +464,7 @@ overhaul.
 ------------------------------------------------------------------------
 
 # 18. OPTIONAL EXTRAS: matrix limit, props out of water reflections, ConeBack
-==========================================================================
-WHAT THEY DO
-------------
+
 1. Generator matrix limit (GeneratorMatrixLimit, GeneratorMatrixPool)
    The game lets only 512 generated props have their own matrix (random scale
    and slope alignment). The code raises that limit (2 immediate values) and,
