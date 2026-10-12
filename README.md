@@ -591,7 +591,7 @@ Compared with the original aggressive version, the intended result is:
 
 ------------------------------------------------------------------------
 
-# 20. Important Disclaimer
+# 21. Important Disclaimer
 
 This edition is designed to **reduce crash risk**, not to mathematically
 guarantee that GTA IV can never crash.
