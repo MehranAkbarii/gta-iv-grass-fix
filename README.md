@@ -523,7 +523,7 @@ feature stays off); it never stops the main fix.
 # 19. Configuration Summary
 
 The Safe Balanced baseline is approximately:
-
+```ini
 [ProceduralPool]
 ; Conservative stability-oriented preset.
 ; Fixed capacities avoid the more aggressive automatic pool expansion.
@@ -576,7 +576,7 @@ ConeTurnLeadMs=300
 
 Exact option names may depend on the final configuration parser used by
 the build.
-
+```
 ------------------------------------------------------------------------
 
 # 20. Expected Result
