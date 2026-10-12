@@ -463,7 +463,66 @@ overhaul.
 
 ------------------------------------------------------------------------
 
-# 18. Configuration Summary
+# 18. OPTIONAL EXTRAS: matrix limit, props out of water reflections, ConeBack
+==========================================================================
+WHAT THEY DO
+------------
+1. Generator matrix limit (GeneratorMatrixLimit, GeneratorMatrixPool)
+   The game lets only 512 generated props have their own matrix (random scale
+   and slope alignment). The code raises that limit (2 immediate values) and,
+   because the matrices come from a pool shared with other objects (7000), also
+   raises the pool (default 28000) so trees and cars are not starved. The new
+   pool is allocated outside the game heap. The limit is capped at pool/6.
+   Not verified in the game: what the engine does with props beyond 512 today.
+   Check it first with the log counters or by eye (far props with the same size
+   and no slope alignment).
+
+2. Props out of water reflections (PropsInWaterReflections=0)
+   Two small hooks in the render list code remove the reflection phase from an
+   entity when (a) the reflection phase is requested, (b) the entity has the
+   generator flags (0x10000 and 0x40000000 at +0x24) and (c) the entity is
+   owned by this mod's ownership table (so nothing else is touched). Props
+   are simply not drawn in the reflection pass. Nothing else changes.
+
+3. ConeBack (ConeBack=<metres>)
+   New props that the generator queues behind the camera are kept in a waiting
+   list instead of being made. They are made later, nearest first, before the
+   camera turns to them.
+   Shape of the cone (all tunable):
+     - everything within ConeBack metres is always made, in every direction;
+     - inside ConeFullAngle degrees of the view direction (default 75, so a
+       150 degree arc, wider than the screen) the full gather distance applies;
+     - outside it the distance falls smoothly down to ConeBack metres behind.
+   Against visible pop-in:
+     - a turning camera is predicted up to ConeTurnLeadMs (default 300 ms,
+       at most 45 degrees ahead), and a prop counts as inside if it is inside
+       the current OR the predicted cone;
+     - a cut or a very fast turn (about 50 degrees in one update, or a 50 m
+       jump) lets everything that qualifies come back in a single update;
+     - otherwise at most ConeReleasePerUpdate (default 384) come back per
+       update, nearest first, so a turn does not cause a stall;
+     - if the waiting list is full (32768) or the camera data is not trusted,
+       props are made instead of being delayed: nothing is lost;
+     - waiting props of a provider that the game removed are dropped, and the
+       list is cleared when the generator is reset or destroyed.
+   It cannot be proven that pop-in is never visible without playing: a very
+   fast flick can still show some props appearing. Raise ConeFullAngle (90-110)
+   or ConeBack, or lower ConeBack to 0 to switch it off.
+
+INI KEYS (section [ProceduralPool]) 
+--------------------------------------------------------
+```ini
+GeneratorMatrixLimit=4096     0 off, else 513..4096
+GeneratorMatrixPool=0         0 automatic, else 7000..65536
+PropsInWaterReflections=1     1 vanilla, 0 skip props in reflections
+ConeBack=70                   0 off, else 20..1000 (metres)
+ConeFullAngle=75              30..120 degrees
+ConeReleasePerUpdate=384      0 = no limit
+ConeTurnLeadMs=300            0..1000 A value that is missing, not a whole number or out of range is ignored (the
+feature stays off); it never stops the main fix.
+```
+--------------------------------------------------------
+# 19. Configuration Summary
 
 The Safe Balanced baseline is approximately:
 
@@ -522,7 +581,7 @@ the build.
 
 ------------------------------------------------------------------------
 
-# 19. Expected Result
+# 20. Expected Result
 
 Compared with vanilla GTA IV, the intended result is:
 
