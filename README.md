@@ -574,7 +574,6 @@ Compared with vanilla GTA IV, the intended result is:
 -   visibly greater procedural grass/object visibility;
 -   more distant grass remaining present;
 -   better procedural object streaming;
--   no `.gfr` files;
 -   lower peak object-pool pressure than the original aggressive
     configuration;
 -   lower diagnostic/runtime overhead;
@@ -588,6 +587,7 @@ Compared with the original aggressive version, the intended result is:
 -   fewer unnecessary diagnostic side effects;
 -   more conservative failure behavior;
 -   a more maintainable Visual Studio build structure.
+-   no `.gfr` files; 
 
 ------------------------------------------------------------------------
 
