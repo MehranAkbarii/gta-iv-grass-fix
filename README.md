@@ -507,17 +507,6 @@ overhaul.
    fast flick can still show some props appearing. Raise ConeFullAngle (90-110)
    or ConeBack, or lower ConeBack to 0 to switch it off.
 
-INI KEYS (section [ProceduralPool]) 
-```ini
-GeneratorMatrixLimit=4096     0 off, else 513..4096
-GeneratorMatrixPool=0         0 automatic, else 7000..65536
-PropsInWaterReflections=1     1 vanilla, 0 skip props in reflections
-ConeBack=70                   0 off, else 20..1000 (metres)
-ConeFullAngle=75              30..120 degrees
-ConeReleasePerUpdate=384      0 = no limit
-ConeTurnLeadMs=300            0..1000 A value that is missing, not a whole number or out of range is ignored (the
-feature stays off); it never stops the main fix.
-```
 --------------------------------------------------------
 # 19. Configuration Summary
 
