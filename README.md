@@ -25,8 +25,7 @@ The edition is designed around the following priorities:
 6.  Remove `.gfr` flight-recorder file generation completely.
 7.  Keep the project suitable for Visual Studio 2026 / MSVC / Win32
     (x86).
-8.  Keep the source tree simple: source, headers, includes, assembly
-    bridge, solution, and project files are kept together in one
+8.  Keep the source tree simple: source, headers, includes, solution, and project files are kept together in one
     directory.
 
 ------------------------------------------------------------------------
