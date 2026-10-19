@@ -184,7 +184,6 @@ int gu_behavior_initialize(DWORD identity_id, float distance_multiplier)
     InterlockedExchange(
         &g_gu_behavior.ownership_lock_ready, 1);
     gu_event_ring_initialize(&g_gu_event_ring);
-    gu_flight_recorder_initialize(&g_gu_flight_recorder);
     gu_event_summary_initialize(&g_gu_event_summary);
     gu_ownership_initialize(&g_gu_ownership);
     g_gu_behavior.identity_id = identity_id;
@@ -760,14 +759,14 @@ static int gu_make_owned_distance(
 static void gu_commit_procobj_owned_wrapper(
     BYTE *wrapper, DWORD surface)
 {
-    BYTE *entity;
-    volatile LONG *distance;
+    BYTE *entity = NULL;
+    volatile LONG *distance = NULL;
     struct GuOwnedRecord existing;
-    DWORD original_bits;
-    DWORD scaled_bits;
-    DWORD token;
+    DWORD original_bits = 0u;
+    DWORD scaled_bits = 0u;
+    DWORD token = 0u;
     DWORD flags = GU_OWNER_SURFACE;
-    DWORD clamped;
+    DWORD clamped = 0u;
     DWORD emit_event = 0u;
 
 #if defined(GTAIV_GRASS_BEHAVIOR_TESTING)

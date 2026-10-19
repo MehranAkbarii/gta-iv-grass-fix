@@ -1,325 +1,650 @@
-# GTA IV Grass & Procedural Props Fix
+# GTA IV Grass & Procedural Objects Fix --- Safe Balanced Edition
 
-Fix disappearing grass and procedural props with automatic pool sizing, configurable density, and distance scaling.
+## Overview
 
-**By [iammrmikeman](https://www.nexusmods.com/gta4/users/19482074)** · **Version 1.2** · **GTA IV / Vice City Nextgen Edition**
+This edition is a conservative, stability-focused rework of the original
+GTA IV Grass / Procedural Objects Fix.
 
-[Download on Nexus Mods](https://www.nexusmods.com/gta4/mods/1230?tab=files) · [Installation](#installation) · [Compile it yourself](#compile-it-yourself) · [Screenshots](#screenshots) · [Support](#support-and-credits)
+The goal is **not** to remove the original mod's functionality. The goal
+is to keep its useful procedural-object and grass streaming improvements
+while reducing the amount of aggressive memory usage, runtime pressure,
+diagnostics, and global game-state modification that can make a 32-bit
+game more fragile.
 
-![GTA IV Grass and Procedural Props Fix cover artwork](assets/images/author-01.webp)
+The edition is designed around the following priorities:
 
-GTA IV normally limits how many procedural objects can exist at the same time. When those limits are reached, grass and other ground details can stop appearing, leaving large or inconsistent empty patches. This mod expands the relevant limits and provides controls for density and distance.
+1.  Increase procedural grass/object draw distance enough to produce a
+    clearly visible improvement over vanilla GTA IV.
+2.  Preserve more grass and procedural objects than vanilla when the
+    configured limits are reached.
+3.  Avoid the very large 32K/40K-style pools used by the original
+    configuration.
+4.  Reduce the probability of streaming stalls, hangs, and crashes
+    during heavy streaming situations such as cutscenes.
+5.  Avoid modifying unrelated model draw distances globally.
+6.  Remove `.gfr` flight-recorder file generation completely.
+7.  Keep the project suitable for Visual Studio 2026 / MSVC / Win32
+    (x86).
+8.  Keep the source tree simple: source, headers, includes, solution, and project files are kept together in one
+    directory.
 
-## Features
+------------------------------------------------------------------------
 
-- Increased capacity for grass and vegetation.
-- Increased capacity for litter, rubbish, and other procedural ground props.
-- More consistent vegetation coverage while travelling through Liberty City.
-- Separate density controls for plants and procedural objects.
-- Configurable procedural-object generation and visibility distance.
-- Automatic pool sizing based on the selected settings.
-- Individual filtering for grass, vegetation, clutter/litter, and other procedural-object classes.
+# 1. Why This Edition Exists
 
-![Grass and flowers across an open park in Liberty City](assets/images/author-03.webp)
+The original project is useful because GTA IV's procedural grass and
+procedural objects can suffer from limited visibility and
+streaming-related behavior.
 
-## Requirements
+However, the original configuration is intentionally aggressive. It can
+maintain very large numbers of procedural and rendered objects and
+contains extensive runtime diagnostics, hooks, tracking structures, and
+generated bridge code.
 
-- A GTA IV or Vice City Nextgen Edition executable covered by the mod. See [Compatibility](#compatibility).
-- FusionFix or another ASI loader configured for your game installation.
+During testing, the original version was observed to be capable of
+problematic behavior under heavy streaming conditions, including:
 
-### Recommended mods shown in the screenshots
+-   cutscene freezes where audio continues while the image stops;
+-   occasional crashes;
+-   unusually heavy streaming situations;
+-   significant runtime overhead when very large object pools are
+    allowed.
 
-The Nexus page recommends these companion mods:
+Because GTA IV is a 32-bit application with a relatively fragile
+streaming architecture, maximizing theoretical object capacity is not
+necessarily the safest way to improve visual distance.
 
-| Mod | Download |
-| --- | --- |
-| Console Vegetation | [Console Visuals releases](https://github.com/Tomasak/Console-Visuals/releases/) |
-| Restored Vegetation | [Nexus Mods](https://www.nexusmods.com/gta4/mods/806?tab=files) |
-| Solitude 3 | [Nexus Mods](https://www.nexusmods.com/gta4/mods/417) |
+The Safe Balanced Edition therefore uses a different philosophy:
 
-The screenshots include other visual mods, so their complete appearance depends on the installed mod setup.
+> Keep the visual improvement, but put hard limits around the systems
+> that can grow excessively.
 
-## Installation
+------------------------------------------------------------------------
 
-1. Close GTA IV and install FusionFix or your preferred ASI loader.
-2. Download the mod from the [Nexus Files page](https://www.nexusmods.com/gta4/mods/1230?tab=files) and extract the archive.
-3. If updating, back up the existing ASI and its matching INI.
-4. Copy these two files into the ASI plugin folder used by your loader:
+# 2. Pool Capacity Changes
 
-   ```text
-   GTAIV.EFLC.ProceduralFixes.asi
-   GTAIV.EFLC.ProceduralFixes.ini
-   ```
+## Original approach
 
-5. Keep both files together and keep only one installed copy of this ASI. Start with the INI supplied with that release.
-6. Set the in-game **Detail Distance** to **100**, as recommended on the Nexus page, then restart the game after changing the mod's settings.
+The original configuration can use very large capacities, including
+values in the 32K--40K range for some procedural/rendered object pools.
 
-For a loader configured to use `plugins`, the layout is:
+Examples of the original design include values such as:
 
-```text
-GTA IV/
-├── GTAIV.exe
-└── plugins/
-    ├── GTAIV.EFLC.ProceduralFixes.asi
-    └── GTAIV.EFLC.ProceduralFixes.ini
+-   Procedural pool: up to approximately `40960`
+-   Rendered-object capacity: up to approximately `32768`
+-   Additional internal tracking/source-bank structures with large
+    capacities
+
+These values provide substantial headroom, but they also allow the mod
+to keep a very large number of objects alive and tracked simultaneously.
+
+## Safe Balanced values
+
+The Safe Balanced Edition uses:
+
+  System                           Safe Balanced
+  ------------------------------ ---------------
+  Procedural Pool                        `16384`
+  Procedural Pool hard ceiling           `16384`
+  Rendered Object Pool                    `8192`
+  Rendered Object hard ceiling            `8192`
+  Source Buffer                           `8192`
+  Source Bank                             `8192`
+  Provider Capacity                         `40`
+
+These are fixed operational limits. The gameplay build does not dynamically resize these pools during runtime.
+
+The purpose is not to make the pool small.
+
+`16384` procedural entries are still substantially above a vanilla-style
+conservative configuration, while remaining far below the most
+aggressive original values.
+
+The `16384` ceiling is a safety boundary rather than a target that the
+mod should constantly reach.
+
+This gives the mod enough room to maintain increased procedural
+visibility without encouraging unbounded growth.
+
+------------------------------------------------------------------------
+
+# 3. Why the Limits Were Not Left at 32768 / 40960
+
+A large pool is not automatically better.
+
+A larger pool can increase:
+
+-   memory usage;
+-   object tracking overhead;
+-   streaming workload;
+-   hook invocation frequency;
+-   lifecycle complexity;
+-   the amount of state that must remain valid during camera changes;
+-   the amount of work required when GTA IV changes streaming
+    priorities.
+
+The problem is especially relevant during cutscenes and other situations
+where the game suddenly requests a different group of models,
+animations, textures, and world objects.
+
+The Safe Balanced Edition therefore follows this rule:
+
+> A full pool should degrade visual coverage gracefully rather than
+> forcing the game to maintain an unnecessarily huge object population.
+
+This is preferable to simply reproducing the original maximum
+capacities.
+
+------------------------------------------------------------------------
+
+# 4. Draw Distance
+
+Draw distance is the primary visual goal of this edition.
+
+The previous conservative configuration was intentionally close to
+vanilla in order to minimize risk. While that was stable during initial
+testing, the visual difference was not always obvious.
+
+The Safe Balanced Edition therefore increases the procedural
+draw-distance multiplier to:
+
+```
+Configured DistanceMultiplier: 1.25
+Effective runtime ceiling: 1.50
 ```
 
-![Procedural ground props along a Liberty City street](assets/images/author-05.webp)
+This provides a visible improvement while avoiding extreme distance
+multipliers.
 
-## Recommended settings
+## Why 1.25x instead of a much larger value?
 
-The Nexus description labels the following preset **Recommended Version 1.1 Settings**. Its values are preserved here:
+Very large distance multipliers can multiply the number of objects that
+need to be considered by the streaming system.
 
+For example, increasing the radius does not merely make existing grass
+visible. It can cause substantially more procedural objects to become
+eligible for creation, tracking, rendering, and streaming.
+
+A moderate multiplier therefore gives a better stability/visual-quality
+balance.
+
+------------------------------------------------------------------------
+
+# 5. Legacy Global Model Draw Distance Mutation Is Disabled
+
+The Safe Balanced Edition deliberately keeps the legacy global model-info draw-distance mutation disabled. Procedural model draw-distance scaling used by the procedural-object system remains active.
+
+This is important because a global modification of model draw distance
+can affect many objects that are unrelated to procedural grass.
+
+The goal of this project is specifically:
+
+-   procedural grass;
+-   procedural vegetation;
+-   procedural props;
+-   their streaming/visibility behavior.
+
+It is not intended to rewrite the draw distance of every model in GTA
+IV.
+
+Keeping the global model-distance mutation disabled reduces unintended
+side effects and makes the behavior easier to reason about.
+
+------------------------------------------------------------------------
+
+# 6. Density Behavior
+
+The public density value remains:
+
+``` ini
+PlantDensityMultiplier=1.0
+ProceduralObjectDensityMultiplier=1.0
+```
+Public density settings remain at their neutral 1.0 configuration and do not intentionally increase object count to compensate for the increased distance.
+
+------------------------------------------------------------------------
+
+# 7. Graceful Capacity Handling
+
+Bounded rejection/clamping; no distance-based eviction
+
+This edition does not replace GTA IV's object lifecycle. It constrains the amount of procedural state the mod can maintain and fails closed when its fixed limits are reached.
+
+The intended priority is:
+
+Pool has room
+    ↓
+accept object
+
+Pool full
+    ↓
+refuse/clamp new entry
+
+This is an important difference from simply using a very small pool.
+
+------------------------------------------------------------------------
+
+# 8. Runtime Stability
+
+The original implementation contains several systems that are reasonable
+for development and reverse-engineering but are not all necessary for a
+normal gameplay-oriented build.
+
+The Safe Balanced Edition reduces unnecessary runtime pressure wherever
+possible.
+
+The design avoids:
+
+-   unnecessarily large runtime pools;
+-   unnecessary global model-distance mutation;
+-   unnecessary diagnostic file generation;
+-   aggressive runtime expansion;
+-   treating optional diagnostics as a reason to terminate the game.
+
+The core procedural-object functionality remains the focus.
+
+------------------------------------------------------------------------
+
+# 9. `.gfr` Flight Recorder Removal
+
+The original project contains a flight-recorder/diagnostic system
+capable of writing `.gfr` data to disk.
+
+The Safe Balanced Edition does **not** generate `.gfr` files.
+
+The disk-writing path has been disabled/removed from the gameplay build.
+
+This was done for several reasons:
+
+-   the flight recorder is not required for normal gameplay;
+-   it creates additional file I/O;
+-   it adds diagnostic complexity that is unnecessary for the release
+    build;
+-   the goal of this edition is a clean gameplay-oriented implementation
+    rather than a debugging build.
+
+The in-memory functionality required by the remaining runtime code is
+kept only where necessary.
+
+No `.gfr` file should be created during normal gameplay.
+
+------------------------------------------------------------------------
+
+# 10. Debug Logging and Watchdog Behavior
+
+Reduce diagnostic/runtime overhead
+
+``` ini
+DebugLog=1
+HangWatchdog=0
+HangMessageBox=0
+FullHangDump=0
+```
+Flight Recorder and destructive diagnostic paths were removed/disabled, while lightweight debug logging remains available.
+
+------------------------------------------------------------------------
+
+# 11. Process Termination Behavior
+
+The original source contains defensive paths involving process
+termination such as `TerminateProcess` / `ExitProcess`.
+
+Such mechanisms can be appropriate when a mod detects an unrecoverable
+initialization or compatibility problem.
+
+However, optional diagnostic failures should not be treated as gameplay
+failures.
+
+The Safe Balanced design therefore avoids using optional diagnostics as
+a reason to terminate the game.
+
+The principle is:
+
+> A diagnostic subsystem failing should not automatically become a
+> game-ending event.
+
+This does not mean that every internal failure can safely be ignored.
+Critical initialization failures still need to fail safely.
+
+------------------------------------------------------------------------
+
+# 12. Runtime Hook Philosophy
+
+The project still uses the runtime hooks required for the
+procedural-object and grass functionality.
+
+However, the Safe Balanced Edition avoids adding hooks merely to
+increase visual quality when the same goal can be achieved through the
+existing procedural-distance path.
+
+The purpose is to minimize the amount of game code that is intercepted.
+
+Every additional hook introduces another point where:
+
+-   calling conventions matter;
+-   registers/state must be preserved;
+-   object lifetimes must remain valid;
+-   game-version assumptions can break;
+-   invalid pointers can result in crashes.
+
+Therefore the edition favors a smaller, clearly defined hook surface.
+
+------------------------------------------------------------------------
+
+# 13. Cutscene Stability
+
+Cutscenes are treated as a particularly important stability scenario.
+
+The original problematic behavior reported during testing was:
+
+-   video/image stops responding;
+-   audio continues;
+-   eventually the game may recover or crash.
+
+Cutscenes can create unusually heavy streaming transitions because the
+game can rapidly request different assets and change camera visibility.
+
+The Safe Balanced configuration therefore avoids extremely large object
+populations and aggressive runtime pool expansion.
+
+The goal is to reduce the amount of procedural state competing with the
+game's normal streaming workload during these transitions.
+
+Cutscenes should therefore be considered a primary validation scenario
+for this edition.
+
+------------------------------------------------------------------------
+
+# 14. Save Safety
+
+The Safe Balanced Edition does not modify GTA IV save data.
+
+The removal of `.gfr` generation also means that the gameplay build does
+not need to maintain a flight-recorder file beside the game files.
+
+The mod should therefore not require any changes to the normal GTA IV
+save workflow.
+
+As with any ASI/plugin that hooks the game executable, normal good
+practice still applies:
+
+-   keep backups of important saves;
+-   do not assume that any third-party game modification can provide an
+    absolute guarantee against every possible game failure.
+
+------------------------------------------------------------------------
+
+# 15. Code Cleanup
+
+The original project is a reverse-engineered game modification and
+therefore contains code that is necessarily more complex than a
+conventional application.
+
+However, the Safe Balanced Edition follows several cleanup principles.
+
+### Single responsibility
+
+Subsystems should have a clear purpose:
+
+-   configuration;
+-   pool management;
+-   procedural object handling;
+-   draw-distance handling;
+-   hooks;
+-   compatibility;
+-   diagnostics.
+
+### Reduced global state
+
+Global state should be limited to information genuinely required across
+runtime hooks.
+
+### Explicit limits
+
+Important capacities are explicitly bounded rather than relying on very
+large implicit values.
+
+### No unnecessary generated files
+
+The release build does not require `.gfr` output.
+
+### Clear build structure
+
+The Visual Studio project is designed for:
+
+``` text
+Visual Studio 2026
+MSVC v145
+Win32 / x86
+```
+
+All source files, headers, include files,
+solution and project files are kept together in a single directory for
+easier inspection and building.
+
+------------------------------------------------------------------------
+
+# 16. Visual Studio 2026 Compatibility
+
+The project targets:
+
+``` text
+Platform: Win32 / x86
+Toolset: MSVC v145
+IDE: Visual Studio 2026
+```
+
+GTA IV is a 32-bit application, so the plugin must be built for
+x86/Win32.
+
+The source does not rely on GCC-only inline assembly syntax inside
+normal MSVC C source files.
+
+This makes the project structure more appropriate for modern Visual
+Studio builds.
+
+------------------------------------------------------------------------
+
+# 17. What Was Intentionally NOT Changed
+
+The following were deliberately left alone:
+
+-   GTA IV save format;
+-   provider capacity (`40`);
+-   unrelated model draw distances;
+-   unrelated game rendering systems;
+-   texture quality;
+-   graphics settings;
+-   vanilla game assets.
+
+The goal is a focused procedural streaming fix, not a general graphics
+overhaul.
+
+------------------------------------------------------------------------
+
+# 18. OPTIONAL EXTRAS: matrix limit, props out of water reflections, ConeBack
+
+1. Generator matrix limit (GeneratorMatrixLimit, GeneratorMatrixPool)
+   The game lets only 512 generated props have their own matrix (random scale
+   and slope alignment). The code raises that limit (2 immediate values) and,
+   because the matrices come from a pool shared with other objects (7000), also
+   raises the pool (default 28000) so trees and cars are not starved. The new
+   pool is allocated outside the game heap. The limit is capped at pool/6.
+   Not verified in the game: what the engine does with props beyond 512 today.
+   Check it first with the log counters or by eye (far props with the same size
+   and no slope alignment).
+
+2. Props out of water reflections (PropsInWaterReflections=0)
+   Two small hooks in the render list code remove the reflection phase from an
+   entity when (a) the reflection phase is requested, (b) the entity has the
+   generator flags (0x10000 and 0x40000000 at +0x24) and (c) the entity is
+   owned by this mod's ownership table (so nothing else is touched). Props
+   are simply not drawn in the reflection pass. Nothing else changes.
+
+3. ConeBack (ConeBack=<metres>)
+   New props that the generator queues behind the camera are kept in a waiting
+   list instead of being made. They are made later, nearest first, before the
+   camera turns to them.
+   Shape of the cone (all tunable):
+     - everything within ConeBack metres is always made, in every direction;
+     - inside ConeFullAngle degrees of the view direction (default 75, so a
+       150 degree arc, wider than the screen) the full gather distance applies;
+     - outside it the distance falls smoothly down to ConeBack metres behind.
+   Against visible pop-in:
+     - a turning camera is predicted up to ConeTurnLeadMs (default 300 ms,
+       at most 45 degrees ahead), and a prop counts as inside if it is inside
+       the current OR the predicted cone;
+     - a cut or a very fast turn (about 50 degrees in one update, or a 50 m
+       jump) lets everything that qualifies come back in a single update;
+     - otherwise at most ConeReleasePerUpdate (default 384) come back per
+       update, nearest first, so a turn does not cause a stall;
+     - if the waiting list is full (32768) or the camera data is not trusted,
+       props are made instead of being delayed: nothing is lost;
+     - waiting props of a provider that the game removed are dropped, and the
+       list is cleared when the generator is reset or destroyed.
+   It cannot be proven that pop-in is never visible without playing: a very
+   fast flick can still show some props appearing. Raise ConeFullAngle (90-110)
+   or ConeBack, or lower ConeBack to 0 to switch it off.
+
+--------------------------------------------------------
+# 19. Configuration Summary
+
+The Safe Balanced baseline is approximately:
 ```ini
 [ProceduralPool]
-Capacity=auto
-RenderedObjectCapacity=auto
-ProviderCapacity=auto
-DistanceMultiplier=1.0
+; Conservative stability-oriented preset.
+; Fixed capacities avoid the more aggressive automatic pool expansion.
+Capacity=16384
+RenderedObjectCapacity=8192
+ProviderCapacity=40
+
+; 1.25x procedural-object distance: visible improvement without the
+; aggressive 2x-4x ranges that can amplify streaming pressure.
+DistanceMultiplier=1.25
+
+; Keep density neutral. Distance is increased, density is not.
 PlantDensityMultiplier=1.0
 ProceduralObjectDensityMultiplier=1.0
 DensityClassMask=3
+
+; Logging is useful for diagnosing compatibility without enabling a message box.
 DebugLog=1
-HangWatchdog=1
-HangTimeoutSeconds=45
-HangMessageBox=1
+HangWatchdog=0
+HangTimeoutSeconds=30
+HangMessageBox=0
+FullHangDump=0
+
+; ---------------------------------------------------------------------------
+; Optional extras.
+; Each feature installs only if all of its byte patterns match exactly once in
+; GTAIV.exe; otherwise it stays off and the log ([EXTRAS]) says why.
+; ---------------------------------------------------------------------------
+
+; More props can be scaled and slope-aligned (the game allows 512). 0 = off.
+; Allowed 513..4096. The matrix pool is raised automatically with it.
+GeneratorMatrixLimit=4096
+; Matrix pool size. 0 = automatic (28000 when the limit is on). 7000..65536.
+GeneratorMatrixPool=0
+
+; 1 = props are drawn in water reflections (vanilla). 0 = they are not.
+PropsInWaterReflections=1
+
+; ConeBack: props behind the camera wait instead of being made, and come back
+; (nearest first) before the camera turns to them. Value = metres that are
+; always made in every direction. 0 = off. Allowed 20..1000.
+ConeBack=70
+; Half angle (degrees) inside which the full distance applies. A larger value
+; makes fewer props wait and hides pop-in better. 30..120.
+ConeFullAngle=75
+; Most waiting props made per update, nearest first. 0 = no limit.
+ConeReleasePerUpdate=384
+; How far ahead (milliseconds) the cone follows a turning camera. 0..1000.
+ConeTurnLeadMs=300
 ```
+Exact option names may depend on the final configuration parser used by
+the build.
 
-**Recommended in-game setting:** Detail Distance **100**.
+------------------------------------------------------------------------
 
-![Grass and procedural props distance fix promotional comparison](assets/images/author-08.webp)
+# 20. Expected Result
 
-## Compatibility
+Compared with vanilla GTA IV, the intended result is:
 
-The [Nexus mod page](https://www.nexusmods.com/gta4/mods/1230) lists these game versions:
+-   visibly greater procedural grass/object visibility;
+-   more distant grass remaining present;
+-   better procedural object streaming;
+-   lower peak object-pool pressure than the original aggressive
+    configuration;
+-   lower diagnostic/runtime overhead;
+-   better behavior under heavy streaming conditions.
 
-| Game | Listed versions |
-| --- | --- |
-| Grand Theft Auto IV | 1.0.4.0, 1.0.7.0, 1.0.8.0 |
-| Grand Theft Auto IV: Complete Edition | 1.2.0.43, 1.2.0.59 |
-| GTA IV: Vice City Nextgen Edition | VCNGE |
+Compared with the original aggressive version, the intended result is:
 
-Executable recognition depends on the exact executable, not just its displayed version number. The v1.2 source release disables the fix for unrecognized executable hashes without applying its patches.
+-   lower maximum pool sizes;
+-   lower risk of excessive runtime memory/state pressure;
+-   less aggressive global modification;
+-   fewer unnecessary diagnostic side effects;
+-   more conservative failure behavior;
+-   a more maintainable Visual Studio build structure.
+-   no `.gfr` files; 
 
-![Vice City Nextgen Edition grass and palm trees at sunset](assets/images/author-11.webp)
+------------------------------------------------------------------------
 
-## Troubleshooting
+# 21. Important Disclaimer
 
-If you experience any of the following, return to the recommended settings for your release and fully restart GTA IV:
+This edition is designed to **reduce crash risk**, not to mathematically
+guarantee that GTA IV can never crash.
 
-- Missing or flickering models.
-- Broken LOD transitions.
-- Objects disappearing.
-- Freezes or crashes.
-- Unusually heavy streaming behaviour.
+The project modifies internal game behavior through runtime hooks. GTA
+IV's internal addresses, structures, streaming system and object
+lifetimes are not officially documented APIs.
 
-When reporting an issue, include:
+Therefore the correct goal is:
 
-- Your complete `GTAIV.EFLC.ProceduralFixes.log`.
-- The GTA IV version and mod version you are using.
-- Your INI settings, ASI loader, and other installed mods.
-- The location and steps that lead to the problem.
+> Reduce unnecessary pressure and dangerous failure modes while
+> retaining a meaningful visual improvement.
 
-Report issues through [Nexus Posts](https://www.nexusmods.com/gta4/mods/1230?tab=posts) or the [iammrmikeman Mods Discord server](https://discord.gg/4pWnszrvMP).
+A completely crash-free guarantee would require exhaustive testing
+across every mission, cutscene, location, weather state, camera state,
+save state, and game configuration.
 
-To roll back, close the game and restore the backed-up ASI and matching INI together. Removing the ASI disables the fix on the next launch.
+For practical validation, the most important tests are:
 
-## Compile it yourself
+1.  dense city areas;
+2.  rapid camera rotation;
+3.  entering/leaving interiors;
+4.  driving quickly through the city;
+5.  mission transitions;
+6.  cutscenes;
+7.  long continuous sessions;
+8.  saving and loading;
+9.  areas with large amounts of procedural vegetation.
 
-These instructions build the **v1.2 C source** into a **32-bit Windows ASI**.
+------------------------------------------------------------------------
 
-### 1. Get the tools and source
+# Final Design Philosophy
 
-- **Windows**, with PowerShell.
-- **TinyCC 0.9.27 for Win32/i386**: get `tcc-0.9.27-win32-bin.zip` from the [TinyCC release archive](https://download.savannah.gnu.org/releases/tinycc/), linked by the [TinyCC project](https://bellard.org/tcc/). Extract the complete compiler folder, including `include` and `lib`, for example to `C:\Tools\tcc`.
-- **[Python 3.10 or newer for Windows](https://www.python.org/downloads/windows/)**, available through `py -3` or `python`. No additional Python packages are needed for the included helper.
-- The complete mod source from this repository or the [source-included Nexus download](https://www.nexusmods.com/gta4/mods/1230?tab=files), together with its matching `GTAIV.EFLC.ProceduralFixes.ini`.
+The original mod demonstrates that GTA IV's procedural grass/object
+system can be pushed substantially beyond its conservative vanilla
+behavior.
 
-Keep all files in `src`, including the generated `.h` and `.inc` files. The compiler command uses the release's explicit list of ten C modules.
+This edition intentionally does **not** chase the maximum possible
+number of objects.
 
-Open PowerShell in the folder containing this layout:
+Instead, it aims for a balanced point:
 
-```text
-project/
-├── README.md
-├── GTAIV.EFLC.ProceduralFixes.ini
-├── src/
-│   ├── GTAIVProceduralPool.c
-│   ├── self_contained_ucl.c
-│   ├── universal_behavior.c
-│   ├── ... remaining C files and headers ...
-│   └── ... generated headers and include files ...
-└── tools/
-    └── harden_pe.py
-```
++ More distance than vanilla
++ more useful grass/object coverage
++ controlled pool sizes
++ no `.gfr` generation
++ reduced diagnostic overhead
++ safer behavior under heavy streaming
 
-The [included `harden_pe.py`](tools/harden_pe.py) is the helper used by the v1.2 release build. Keep it alongside the source when adding this README to a repository.
+The central principle is:
 
-### 2. Compile the ASI
+> **Prefer a small visual degradation at the extreme streaming limit
+> over risking instability in the entire game.**
 
-Adjust the first line to the location of your extracted compiler, then run:
-
-```powershell
-$tcc = 'C:\Tools\tcc\tcc.exe'
-
-& $tcc -v
-# Expected: tcc version 0.9.27 (i386 Windows)
-
-$sources = @(
-    'src\GTAIVProceduralPool.c'
-    'src\universal_behavior.c'
-    'src\universal_behavior_hooks.c'
-    'src\universal_hooks.c'
-    'src\universal_install.c'
-    'src\universal_pipeline.c'
-    'src\universal_plant_bank.c'
-    'src\universal_profiles.c'
-    'src\universal_source_bank.c'
-    'src\self_contained_ucl.c'
-)
-
-New-Item -ItemType Directory -Path build -Force | Out-Null
-
-& $tcc -m32 -Wall -Werror -shared -I src @sources -lkernel32 -luser32 -lmsvcrt -o build\raw.asi
-if ($LASTEXITCODE -ne 0) { throw 'Compilation failed.' }
-```
-
-Use the **i386 Windows** compiler even on a 64-bit Windows installation. The mod runs inside GTA IV's 32-bit process.
-
-### 3. Process the compiled binary
-
-Run the release helper to enable the PE's ASLR and DEP compatibility flags, normalize the linker timestamp, and calculate and verify its checksum:
-
-```powershell
-py -3 tools\harden_pe.py build\raw.asi build\GTAIV.EFLC.ProceduralFixes.asi --report build\HARDENING.json
-if ($LASTEXITCODE -ne 0) { throw 'ASI processing failed.' }
-
-Copy-Item -LiteralPath GTAIV.EFLC.ProceduralFixes.ini -Destination build\GTAIV.EFLC.ProceduralFixes.ini
-
-Get-FileHash -Algorithm SHA256 build\GTAIV.EFLC.ProceduralFixes.asi
-```
-
-If your installation uses `python` instead of the Windows launcher, replace `py -3` with `python`.
-
-The installable files are now:
-
-```text
-build/GTAIV.EFLC.ProceduralFixes.asi
-build/GTAIV.EFLC.ProceduralFixes.ini
-```
-
-Install this pair using the [installation steps](#installation). Keep `raw.asi` as an intermediate build file; install the final `GTAIV.EFLC.ProceduralFixes.asi`.
-
-
-
-## Screenshots
-
-All 17 gallery images and the Nexus page banner are included. The featured images above and the additional images below come from the [original Nexus gallery](https://www.nexusmods.com/gta4/mods/1230?tab=images).
-
-### More images by iammrmikeman
-
-<details>
-<summary>View six additional author screenshots</summary>
-
-| Park path | Vegetation coverage |
-| --- | --- |
-| ![Tree-lined park path with grass along its edges](assets/images/author-02.webp) | ![Mixed grass and vegetation in a Liberty City park](assets/images/author-04.webp) |
-
-| Grass and procedural vegetation | Grass and flowers |
-| --- | --- |
-| ![Niko standing among grass and procedural vegetation](assets/images/author-06.webp) | ![Grass and flowers beneath park trees](assets/images/author-07.webp) |
-
-| Vice City during the day | Vice City at night |
-| --- | --- |
-| ![A red car beside grass and palm trees in Vice City Nextgen Edition](assets/images/author-09.webp) | ![Grass outside illuminated buildings in Vice City Nextgen Edition at night](assets/images/author-10.webp) |
-
-</details>
-
-### Community images
-
-<details>
-<summary>View six community screenshots by JKCsaba and T1ru</summary>
-
-**JKCsaba**
-
-![Community screenshot by JKCsaba showing procedural plants on an elevated urban walkway at sunset](assets/images/community-jkcsaba-01.webp)
-
-**T1ru**
-
-| Grass beside buildings | Vegetation beneath a bridge |
-| --- | --- |
-| ![Community screenshot by T1ru of grass beside a brick building](assets/images/community-t1ru-01.webp) | ![Community screenshot by T1ru of vegetation beneath an elevated road](assets/images/community-t1ru-02.webp) |
-
-| Park vegetation | Roadside grass |
-| --- | --- |
-| ![Community screenshot by T1ru of grass and plants in a park](assets/images/community-t1ru-03.webp) | ![Community screenshot by T1ru of grass beside a coastal road](assets/images/community-t1ru-04.webp) |
-
-![Community screenshot by T1ru of vegetation around a graffiti-covered bridge support](assets/images/community-t1ru-05.webp)
-
-</details>
-
-[Image credits and original Nexus image links](assets/IMAGE_SOURCES.md).
-
-## Version history
-
-<details>
-<summary>View release highlights</summary>
-
-### 1.2
-
-- Adds another independently identified VCNGE executable variant.
-- Updates density scaling so the new `1.0` baseline represents the previous `0.5` setting.
-- Adds bounded initialization coordination for compatible ASI loaders.
-- Defers optional diagnostic initialization until after patch installation.
-- Uses strict executable-hash selection and disables the fix for unknown hashes.
-
-These v1.2 notes come from the packaged release changelog.
-
-### 1.1
-
-- Added VCNGE compatibility.
-- Introduced an optional guarded profile check for unrecognized executables. Version 1.2 replaces that behaviour with strict hash-based refusal.
-
-### 1.0
-
-- Added coordinated distance scaling for generation, source queries, residency, and rendering.
-- Introduced automatic capacity sizing, separate plant/object density settings, and class filtering.
-- Expanded procedural storage and added executable identification, validation, rollback, and diagnostics.
-- Made the source available to the community.
-
-### 0.9.8
-
-- Expanded recognition of 1.0.8.0 executables and Gillian's Modpack.
-
-### 0.9.7
-
-- Introduced 1.0.8.0 compatibility, corrected recognition of another 1.2.0.59 variant, and added an option to disable debug logging.
-
-</details>
-
-## Open source
-
-The mod's source has been available since version 1.0 so the community can inspect its implementation and future development. See [Compile it yourself](#compile-it-yourself) to build the included source.
-
-For reuse and distribution terms, refer to **Permissions and credits** on the [Nexus mod page](https://www.nexusmods.com/gta4/mods/1230).
-
-## Support and credits
-
-**My mods will always be free.**
-
-- **YouTube:** [@Iammrmikeman](https://www.youtube.com/@Iammrmikeman) - please support the channel.
-- **Email:** [iammrmikeman25@gmail.com](mailto:iammrmikeman25@gmail.com).
-- **Discord:** [iammrmikeman Mods](https://discord.gg/4pWnszrvMP).
-- **Nexus:** [iammrmikeman](https://www.nexusmods.com/gta4/users/19482074).
-
-Be patient - I might be buried in a debug log.
-
-A big thank you to **TJDM**, whose video **"GTA IV Has a Grass Problem"** inspired this mod.
-
-Screenshots and artwork are credited to **iammrmikeman**, **JKCsaba**, and **T1ru** as identified in the Nexus gallery.
-
-![Grass and Procedural Props Distance Fix Nexus page banner](assets/images/nexus-banner.webp)
-
----
-
-Adapted from the [Nexus description](https://www.nexusmods.com/gta4/mods/1230) and [image gallery](https://www.nexusmods.com/gta4/mods/1230?tab=images), checked on 6 September 2026. The v1.2 settings note and build instructions were checked against the corresponding local release source and documentation.
+That is the reason this edition uses bounded pools and moderate distance
+scaling rather than simply reproducing the original 32K/40K-style
+configuration.

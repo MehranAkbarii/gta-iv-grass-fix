@@ -4,7 +4,6 @@
 
 struct GuEventRing g_gu_event_ring;
 struct GuEventDrainSummary g_gu_event_summary;
-struct GuFlightRecorder g_gu_flight_recorder;
 struct GuOwnershipTable g_gu_ownership;
 DWORD g_gu_source_buffer[GU_SOURCE_BUFFER_CAPACITY];
 float g_gu_source_radius = 30.0f;
@@ -58,111 +57,6 @@ static void gu_update_high_watermark(volatile LONG *value, LONG candidate)
     }
 }
 
-void gu_flight_recorder_initialize(struct GuFlightRecorder *recorder)
-{
-    if (recorder) {
-        ZeroMemory(recorder, sizeof(*recorder));
-    }
-}
-
-void gu_flight_recorder_freeze(struct GuFlightRecorder *recorder)
-{
-    if (recorder) {
-        InterlockedExchange(&recorder->frozen, 1);
-    }
-}
-
-void gu_flight_recorder_resume(struct GuFlightRecorder *recorder)
-{
-    if (recorder) {
-        InterlockedExchange(&recorder->frozen, 0);
-    }
-}
-
-static void gu_flight_recorder_emit(
-    struct GuFlightRecorder *recorder, const struct GuRawEvent *event)
-{
-    LONG sequence;
-    struct GuFlightRecorderSlot *slot;
-    struct GuRawEvent copy;
-    if (!recorder || !event) {
-        return;
-    }
-    if (InterlockedCompareExchange(&recorder->frozen, 0, 0) != 0) {
-        InterlockedIncrement(&recorder->lost_frozen);
-        return;
-    }
-    sequence = InterlockedIncrement(&recorder->next_sequence) - 1;
-    slot = &recorder->slots[(DWORD)sequence & GU_FLIGHT_RECORDER_MASK];
-    InterlockedExchange(&slot->committed_sequence, 0);
-    copy = *event;
-    copy.sequence = (DWORD)sequence;
-    /* Lifecycle hooks must not cross into a timing or thread API before the
-     * displaced engine instructions continue.  The atomic sequence supplies
-     * total recorder order; capture time is added only by the deferred flush. */
-    slot->event = copy;
-    InterlockedExchange(&slot->committed_sequence, sequence + 1);
-}
-
-DWORD gu_flight_recorder_snapshot(
-    const struct GuFlightRecorder *recorder,
-    struct GuRawEvent *events, DWORD event_capacity,
-    DWORD *first_sequence, DWORD *next_sequence,
-    DWORD *lost_frozen)
-{
-    DWORD end;
-    DWORD start;
-    DWORD sequence;
-    DWORD copied = 0u;
-    if (first_sequence) {
-        *first_sequence = 0u;
-    }
-    if (next_sequence) {
-        *next_sequence = 0u;
-    }
-    if (lost_frozen) {
-        *lost_frozen = 0u;
-    }
-    if (!recorder || !events || event_capacity == 0u) {
-        return 0u;
-    }
-    end = (DWORD)InterlockedCompareExchange(
-        (volatile LONG *)&recorder->next_sequence, 0, 0);
-    start = end > GU_FLIGHT_RECORDER_CAPACITY ?
-        end - GU_FLIGHT_RECORDER_CAPACITY : 0u;
-    if (end - start > event_capacity) {
-        start = end - event_capacity;
-    }
-    for (sequence = start; sequence != end; ++sequence) {
-        const struct GuFlightRecorderSlot *slot =
-            &recorder->slots[sequence & GU_FLIGHT_RECORDER_MASK];
-        LONG committed = InterlockedCompareExchange(
-            (volatile LONG *)&slot->committed_sequence, 0, 0);
-        struct GuRawEvent copy;
-        if ((DWORD)committed != sequence + 1u) {
-            continue;
-        }
-        copy = slot->event;
-        if ((DWORD)InterlockedCompareExchange(
-                (volatile LONG *)&slot->committed_sequence, 0, 0) !=
-                sequence + 1u || copy.sequence != sequence) {
-            continue;
-        }
-        events[copied++] = copy;
-    }
-    if (first_sequence) {
-        *first_sequence = start;
-    }
-    if (next_sequence) {
-        *next_sequence = end;
-    }
-    if (lost_frozen) {
-        *lost_frozen = (DWORD)InterlockedCompareExchange(
-            (volatile LONG *)&recorder->lost_frozen, 0, 0);
-    }
-    return copied;
-}
-
 void gu_event_ring_initialize(struct GuEventRing *ring)
 {
     DWORD index;
@@ -186,7 +80,6 @@ int gu_event_try_emit(
     if (!ring || !event) {
         return 0;
     }
-    gu_flight_recorder_emit(&g_gu_flight_recorder, event);
     type = event->type < GU_EVENT_TYPE_COUNT ? event->type : 0u;
     if (InterlockedCompareExchange(&ring->enabled, 0, 0) == 0) {
         InterlockedIncrement(&ring->lost_disabled[type]);
