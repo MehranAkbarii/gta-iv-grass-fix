@@ -3,8 +3,16 @@
 
 #include <windows.h>
 
-#define GU_FASTCALL __attribute__((fastcall))
-#define GU_CDECL __attribute__((cdecl))
+#if defined(_MSC_VER)
+#  define GU_FASTCALL __fastcall
+#  define GU_CDECL __cdecl
+#elif defined(__GNUC__) || defined(__clang__)
+#  define GU_FASTCALL __attribute__((fastcall))
+#  define GU_CDECL __attribute__((cdecl))
+#else
+#  define GU_FASTCALL
+#  define GU_CDECL
+#endif
 
 typedef void * (GU_FASTCALL *GuCreateGateway)(
     BYTE *manager, DWORD ignored_edx,

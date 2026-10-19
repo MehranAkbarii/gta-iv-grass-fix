@@ -1,6 +1,8 @@
 /* Generated from grass_compatibility_catalog.json. Do not edit. */
 #ifndef GTAIV_GRASS_COMPAT_GENERATED_H
 #define GTAIV_GRASS_COMPAT_GENERATED_H
+
+#include <windows.h>
 #define GTAIV_GRASS_COMPAT_TARGET_COUNT 13u
 #define GTAIV_GRASS_COMPAT_CAPABILITY_COUNT 12u
 #define GTAIV_GRASS_MAIN_PROFILE_COUNT 9u

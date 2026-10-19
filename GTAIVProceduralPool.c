@@ -6,9 +6,9 @@
 #include "universal_install.h"
 #include "universal_profiles.h"
 #include "grass_compat.generated.h"
+#include "gu_extras.h"
 
-/* TinyCC's Win32 CRT declaration is kept local to avoid a broad CRT header. */
-int __cdecl atexit(void (__cdecl *function)(void));
+static void log_extras_report(void);
 
 /* TinyCC's bundled Win32 headers omit the native thread-enumeration
  * declarations used by the startup transaction.  Resolve both ntdll entry
@@ -100,15 +100,19 @@ struct GuStartupQuiescence {
 };
 
 #define PLUGIN_NAME "GTAIV.EFLC.ProceduralFixes"
-#define PLUGIN_VERSION "v1.2-GRASS-BLD-0050"
-#define DEFAULT_CAPACITY 40960u
+#define PLUGIN_VERSION "v1.3-Conservative-SAFE-GRASS-BLD-0051"
+#define DEFAULT_CAPACITY 16384u
 #define VANILLA_CAPACITY 512u
 #define MIN_CAPACITY 512u
-#define MAX_OPERATIONAL_CAPACITY 40960u
-#define DEFAULT_RENDERED_OBJECT_CAPACITY 4096u
+#define MAX_OPERATIONAL_CAPACITY 16384u
+#define DEFAULT_RENDERED_OBJECT_CAPACITY 8192u
 #define VANILLA_RENDERED_OBJECT_CAPACITY 512u
 #define MIN_RENDERED_OBJECT_CAPACITY 512u
-#define MAX_RENDERED_OBJECT_CAPACITY 32768u
+#define MAX_RENDERED_OBJECT_CAPACITY 8192u
+typedef char gu_ownership_capacity_is_power_of_two[
+    ((GU_OWNERSHIP_CAPACITY & (GU_OWNERSHIP_CAPACITY - 1u)) == 0u) ? 1 : -1];
+typedef char gu_ownership_capacity_load_check[
+    (GU_OWNERSHIP_CAPACITY >= 4u * MAX_RENDERED_OBJECT_CAPACITY) ? 1 : -1];
 #define DEFAULT_PROVIDER_CAPACITY 40u
 #define VANILLA_PROVIDER_CAPACITY 40u
 #define MIN_PROVIDER_CAPACITY 40u
@@ -118,15 +122,15 @@ struct GuStartupQuiescence {
 #define MAX_DISTANCE_MULTIPLIER 50u
 #define DEFAULT_CORRECTED_DISTANCE_MULTIPLIER 1.0f
 #define MIN_CORRECTED_DISTANCE_MULTIPLIER 0.5f
-#define MAX_CORRECTED_DISTANCE_MULTIPLIER 4.0f
+#define MAX_CORRECTED_DISTANCE_MULTIPLIER 1.5f
 /*
  * Retained VCNE telemetry exhausted the former 4096-record automatic
  * baseline during a neutral one-hour session (4008 high-watermark plus
- * 11748 fallback allocations).  The fixed 32768 ceiling costs bounded
+ * bounded fallback allocations).  The fixed conservative ceiling costs bounded
  * private storage and removes capacity guessing from public defaults.
  */
-#define AUTO_RENDER_PROFILE_1 32768u
-#define AUTO_RENDER_PROFILE_4 32768u
+#define AUTO_RENDER_PROFILE_1 8192u
+#define AUTO_RENDER_PROFILE_4 8192u
 #define LEGACY_DISTANCE_OPERAND_PATCH_ENABLED 0u
 #define LEGACY_MODEL_GLOBAL_DRAW_DISTANCE_MUTATION_ENABLED 0u
 #define GENERATED_PROCOBJ_DISTANCE_LIFECYCLE_ENABLED 1u
@@ -1090,7 +1094,6 @@ static char g_crash_fallback_dump_path[MAX_PATH];
 static char g_hang_dump_path[MAX_PATH];
 static char g_hang_fallback_dump_path[MAX_PATH];
 static char g_hang_summary_path[MAX_PATH];
-static char g_flight_recorder_path[MAX_PATH];
 static char g_self_sha256[65];
 static char g_ini_sha256[65];
 static char g_main_sha256[65];
@@ -1124,15 +1127,6 @@ static DWORD g_hang_watchdog_enabled = DEFAULT_HANG_WATCHDOG;
 static DWORD g_hang_timeout_seconds = DEFAULT_HANG_TIMEOUT_SECONDS;
 static DWORD g_hang_message_box_enabled = DEFAULT_HANG_MESSAGE_BOX;
 static DWORD g_full_hang_dump_enabled = DEFAULT_FULL_HANG_DUMP;
-static struct GuRawEvent
-    g_flight_snapshot[GU_FLIGHT_RECORDER_CAPACITY];
-static DWORD g_flight_snapshot_count;
-static DWORD g_flight_snapshot_first_sequence;
-static DWORD g_flight_snapshot_next_sequence;
-static DWORD g_flight_snapshot_lost_frozen;
-static DWORD g_flight_snapshot_reason;
-static volatile LONG g_flight_snapshot_ready;
-static DWORD g_clean_exit_flush_registered;
 static LPTOP_LEVEL_EXCEPTION_FILTER g_previous_unhandled_filter;
 static DWORD g_unhandled_filter_installed;
 static DWORD g_existing_crash_dump_at_start;
@@ -1634,17 +1628,6 @@ static int startup_quiescence_has_live_tid(
     return 0;
 }
 
-#ifndef GTAIVPOOL_TEST_NO_FATAL
-static void startup_quiescence_terminate_now(DWORD status)
-{
-    g_report.status = status;
-    TerminateProcess(GetCurrentProcess(), status);
-    for (;;) {
-        SwitchToThread();
-    }
-}
-#endif
-
 static int startup_quiescence_resume_all(
     struct GuStartupQuiescence *guard)
 {
@@ -1695,16 +1678,17 @@ static int startup_quiescence_resume_all(
     g_report.startup_quiescence_resume_failures += failures;
     if (failures != 0u) {
         g_report.status = STATUS_STARTUP_QUIESCENCE_RESUME_FAILED;
-#ifndef GTAIVPOOL_TEST_NO_FATAL
-        /* No logging, loader work, heap work, or cleanup is safe while a
-         * possibly lock-owning thread remains stopped. Terminate directly
-         * from this fixed-storage path; if the syscall itself cannot finish,
-         * retain the attach gate and yield forever rather than run torn. */
-        startup_quiescence_terminate_now(
-            STATUS_STARTUP_QUIESCENCE_RESUME_FAILED);
-#else
+        /* The host process is never terminated. A thread that could not be
+         * resumed keeps its live handle (closing it would make the
+         * suspension unrecoverable). Release the attach gate so ordinary
+         * threads cannot deadlock behind it, and report failure so the
+         * caller neither clears the guard nor publishes PATCH_APPLIED. */
+        InterlockedExchange(
+            &g_startup_patch_thread_attach_gate, 0);
+        g_report.startup_thread_attach_gate_waits =
+            (DWORD)InterlockedCompareExchange(
+                &g_startup_thread_attach_gate_waits, 0, 0);
         return 0;
-#endif
     }
     guard->count = 0u;
     guard->active = 0u;
@@ -3061,52 +3045,28 @@ static int resolve_automatic_pool_profile(
     DWORD *rendered_capacity,
     DWORD *provider_capacity)
 {
-    float effective_distance = distance_multiplier;
-    float effective_density = plant_density_multiplier;
-    float demand;
-    float requested_rendered;
-    DWORD rendered_units;
     if (!surface_capacity || !rendered_capacity ||
         !provider_capacity ||
         distance_multiplier < MIN_CORRECTED_DISTANCE_MULTIPLIER ||
         distance_multiplier > MAX_CORRECTED_DISTANCE_MULTIPLIER ||
-        plant_density_multiplier <
-            MIN_CORRECTED_PLANT_DENSITY_MULTIPLIER ||
-        plant_density_multiplier >
-            MAX_CORRECTED_PLANT_DENSITY_MULTIPLIER ||
-        procobj_density_multiplier <
-            MIN_PROCOBJ_DENSITY_MULTIPLIER ||
-        procobj_density_multiplier >
-            MAX_PROCOBJ_DENSITY_MULTIPLIER) {
+        plant_density_multiplier < MIN_CORRECTED_PLANT_DENSITY_MULTIPLIER ||
+        plant_density_multiplier > MAX_CORRECTED_PLANT_DENSITY_MULTIPLIER ||
+        procobj_density_multiplier < MIN_PROCOBJ_DENSITY_MULTIPLIER ||
+        procobj_density_multiplier > MAX_PROCOBJ_DENSITY_MULTIPLIER) {
         return 0;
     }
-    if (effective_distance < 1.0f) {
-        effective_distance = 1.0f;
-    }
-    if (effective_density < procobj_density_multiplier) {
-        effective_density = procobj_density_multiplier;
-    }
-    if (effective_density < 1.0f) {
-        effective_density = 1.0f;
-    }
-    demand = effective_distance * effective_distance * effective_density;
-    requested_rendered = (float)AUTO_RENDER_PROFILE_1 * demand;
-    *surface_capacity = MAX_OPERATIONAL_CAPACITY;
-    *provider_capacity = VANILLA_PROVIDER_CAPACITY;
-    if (requested_rendered >= (float)AUTO_RENDER_PROFILE_4) {
-        *rendered_capacity = AUTO_RENDER_PROFILE_4;
-    } else {
-        rendered_units =
-            (DWORD)(requested_rendered / 512.0f);
-        if ((float)(rendered_units * 512u) < requested_rendered) {
-            ++rendered_units;
-        }
-        *rendered_capacity = rendered_units * 512u;
-        if (*rendered_capacity < AUTO_RENDER_PROFILE_1) {
-            *rendered_capacity = AUTO_RENDER_PROFILE_1;
-        }
-    }
+
+    /* Automatic selection is deliberately bounded.  Distance/density never
+     * promotes the runtime into the former 32K/40K allocation regime. */
+    *surface_capacity = DEFAULT_CAPACITY;
+    *rendered_capacity = DEFAULT_RENDERED_OBJECT_CAPACITY;
+    *provider_capacity = DEFAULT_PROVIDER_CAPACITY;
     return 1;
+}
+
+static DWORD float_to_bits(float value)
+{
+    return read_u32((const BYTE *)&value);
 }
 
 static void write_u32(BYTE *address, DWORD value)
@@ -3157,7 +3117,26 @@ void generator_pop_trampoline(void);
 void *generator_builtin_pop_call(void *list);
 void *generator_pop_hook_c(BYTE *manager);
 
-#ifdef __TINYC__
+#if defined(_MSC_VER) && !defined(__clang__)
+__declspec(naked) void generator_pop_trampoline(void)
+{
+    __asm {
+        push ecx
+        call generator_pop_hook_c
+        add esp, 4
+        ret
+    }
+}
+
+__declspec(naked) void *generator_builtin_pop_call(void *list)
+{
+    __asm {
+        mov ecx, [esp + 4]
+        mov eax, g_generator_builtin_pop
+        jmp eax
+    }
+}
+#elif defined(__TINYC__)
 __asm__(
     ".text\n"
     ".globl generator_pop_trampoline\n"
@@ -3174,57 +3153,43 @@ __asm__(
     "jmp *%eax\n"
 );
 #else
-__asm__(
-    ".text\n"
-    ".globl _generator_pop_trampoline\n"
-    "_generator_pop_trampoline:\n"
-    "push %ecx\n"
-    "call _generator_pop_hook_c\n"
-    "add $4,%esp\n"
-    "ret\n"
-
-    ".globl _generator_builtin_pop_call\n"
-    "_generator_builtin_pop_call:\n"
-    "mov 4(%esp),%ecx\n"
-    "mov _g_generator_builtin_pop,%eax\n"
-    "jmp *%eax\n"
-);
+#error "This source requires either MSVC x86 inline assembly or TinyCC for the trampoline layer."
 #endif
 
 #ifdef GTAIVPOOL_TEST_NO_FATAL
 void *generator_fixture_pop(void *list);
-#ifdef __TINYC__
+#if defined(_MSC_VER) && !defined(__clang__)
+__declspec(naked) void *generator_fixture_pop(void *list)
+{
+    __asm {
+        mov eax, [ecx + 4]
+        test eax, eax
+        jz fixture_null
+        cmp eax, [ecx + 8]
+        jne fixture_middle
+        dec dword ptr [ecx]
+        mov dword ptr [ecx + 4], 0
+        mov dword ptr [ecx + 8], 0
+        ret
+fixture_middle:
+        mov edx, [eax]
+        mov [ecx + 4], edx
+        test edx, edx
+        jz fixture_after_next
+        mov dword ptr [edx + 4], 0
+fixture_after_next:
+        dec dword ptr [ecx]
+        ret
+fixture_null:
+        xor eax, eax
+        ret
+    }
+}
+#elif defined(__TINYC__)
 __asm__(
     ".text\n"
     ".globl generator_fixture_pop\n"
     "generator_fixture_pop:\n"
-    "mov 4(%ecx),%eax\n"
-    "test %eax,%eax\n"
-    "jz 2f\n"
-    "cmp 8(%ecx),%eax\n"
-    "jne 1f\n"
-    "decl (%ecx)\n"
-    "movl $0,4(%ecx)\n"
-    "movl $0,8(%ecx)\n"
-    "ret\n"
-    "1:\n"
-    "mov (%eax),%edx\n"
-    "mov %edx,4(%ecx)\n"
-    "test %edx,%edx\n"
-    "jz 3f\n"
-    "movl $0,4(%edx)\n"
-    "3:\n"
-    "decl (%ecx)\n"
-    "ret\n"
-    "2:\n"
-    "xor %eax,%eax\n"
-    "ret\n"
-);
-#else
-__asm__(
-    ".text\n"
-    ".globl _generator_fixture_pop\n"
-    "_generator_fixture_pop:\n"
     "mov 4(%ecx),%eax\n"
     "test %eax,%eax\n"
     "jz 2f\n"
@@ -5343,7 +5308,6 @@ static void build_log(void)
     ZeroMemory(&source_prepare, sizeof(source_prepare));
     gu_source_bank_get_prepare_diagnostic(&source_prepare);
 
-    log_append("GTAIV Grass & Procedural Props Fix By : iammrmikeman\r\n");
     log_append(PLUGIN_NAME " " PLUGIN_VERSION "\r\n");
     log_append("UTC: ");
     log_append_u32((DWORD)utc.wYear);
@@ -5765,11 +5729,11 @@ static void build_log(void)
         "secondary checks. Unknown hashes are never guessed.\r\n");
     log_append(
         "Pool values may be literal 'auto' or strict manual integers. Auto keeps "
-        "the proven 40,960 surface pool, selects 4,096-32,768 generated wrappers "
+        "the 16,384 surface-pool default, selects up to 8,192 generated wrappers "
         "from distance-squared times density pressure, and keeps GTA IV's vanilla "
         "40-provider storage. DistanceMultiplier coherently scales procedural "
         "manager residency/coverage, the 15-120m source-query radius with a "
-        "32,768-pointer mod bank, and only live wrapper-owned PROCOBJ instance "
+        "8,192-pointer mod bank, and only live wrapper-owned PROCOBJ instance "
         "visibility. The shared model-global draw-distance mutation stays retired.\r\n");
     log_key_text(
         "Density safety",
@@ -5990,10 +5954,6 @@ static void build_log(void)
     log_key_text("Crash dump path", g_crash_dump_path);
     log_key_text("Hang dump path", g_hang_dump_path);
     log_key_text("Immutable hang summary path", g_hang_summary_path);
-    log_key_text("Flight recorder path", g_flight_recorder_path);
-    log_key_u32(
-        "Clean-exit recorder flush registered",
-        g_clean_exit_flush_registered);
     log_key_u32(
         "Existing hang dump was present before this launch",
         g_existing_hang_dump_at_start);
@@ -6134,6 +6094,7 @@ static void build_log(void)
         (!g_report.hang_watchdog_enabled ||
          g_report.hang_watchdog_thread_started != 0u));
 
+    log_extras_report();
     log_append("\r\n[STARTUP PATCH MANIFEST]\r\n");
     log_append("Capacity immediate RVA: ");
     log_append_hex32(
@@ -6337,9 +6298,9 @@ static void build_log(void)
     log_append("- the configurable capacity expands three 0x60-byte surface arrays.\r\n");
     log_append("- a separate downstream generator owns 512 embedded 0x18-byte\r\n");
     log_append("  live-object wrappers and separate 512 rendered/staging limits.\r\n");
-    log_append("- this owner-test branch permits RenderedObjectCapacity from 512 to 32,768.\r\n");
+    log_append("- this build permits RenderedObjectCapacity from 512 to 8,192.\r\n");
     log_append("  Values above 512 use the exact-profile allocator, eviction, activation,\r\n");
-    log_append("  and staging patch set; 32,768 is the experimental hard ceiling.\r\n");
+    log_append("  and staging patch set; 8,192 is the hard ceiling.\r\n");
     if (g_build_profile->provider_supported) {
         log_append("- auto always selects GTA IV's vanilla ProviderCapacity=40.\r\n");
         log_append("  Manual values above 40 are refused after owner-observed LOD flicker\r\n");
@@ -6369,7 +6330,7 @@ static void build_log(void)
     log_append("  experimental 0.5x clamps the near edge to zero and shortens that band.\r\n");
     log_append("- legacy CBaseModelInfo draw-distance scaling is retired because it is\r\n");
     log_append("  model-global and can affect placed/non-procedural objects.\r\n");
-    log_append("- source enumeration uses a bounded 32,768-pointer mod bank and a 15-120m\r\n");
+    log_append("- source enumeration uses a bounded 8,192-pointer mod bank and a 15-120m\r\n");
     log_append("  query radius; generated PROCOBJ visibility is changed only after exact\r\n");
     log_append("  wrapper/surface ownership publication.\r\n");
     log_append("- after procedural.dat loads, exact field fingerprints select only the\r\n");
@@ -7288,7 +7249,7 @@ static void write_telemetry_sample(
 
     log_append(
         "\r\nProcedural surface pool (vanilla 512; core fix configured "
-        "up to 40,960):\r\n");
+        "up to 16,384):\r\n");
     log_key_u32("Surface active", snapshot->surface_active);
     log_key_u32("Surface free", snapshot->surface_free);
     log_key_u32("Surface high watermark", high_surface);
@@ -7333,7 +7294,7 @@ static void write_telemetry_sample(
 
     log_append(
         "\r\nDownstream rendered procedural-object generator "
-        "(vanilla 512; bounded owner-test expansion up to 32,768):\r\n");
+        "(vanilla 512; bounded expansion up to 8,192):\r\n");
     log_key_u32(
         "Generator manager readable",
         snapshot->generator_readable);
@@ -7979,6 +7940,53 @@ static int telemetry_snapshot_has_anomaly(
         g_report.model_distance_live_mismatches != 0u;
 }
 
+static void log_extras_runtime(DWORD sample_number)
+{
+    const struct GuExtrasReport *r = &g_gu_extras_report;
+    if (r->matrix_status != GU_X_ON && r->reflections_status != GU_X_ON &&
+        r->cone_status != GU_X_ON) {
+        return;
+    }
+    telemetry_begin_block("EXTRAS RUNTIME");
+    if (r->reflections_status == GU_X_ON) {
+        log_key_u32("Reflection hook memory faults contained (feature off after the first)", r->reflections_faults);
+    }
+    if (r->cone_status == GU_X_ON) {
+        log_key_u32("Cone hook memory faults contained (feature off after the first)", r->cone_faults);
+    }
+    log_key_u32("Sample", sample_number);
+    if (r->matrix_status == GU_X_ON) {
+        log_key_u32("Matrix pool allocations by the pool hook", r->matrix_pool_allocs);
+        log_key_u32("Matrix pool allocations that fell back to the game", r->matrix_pool_alloc_fallbacks);
+        log_key_u32("Matrix pool releases of our pool", r->matrix_pool_frees_ours);
+        log_key_u32("Matrix pool releases forwarded to the game", r->matrix_pool_frees_forwarded);
+    }
+    if (r->reflections_status == GU_X_ON) {
+        log_key_u32("Reflection calls with a reflection phase", r->reflections_candidates);
+        log_key_u32("  of those with generator flags", r->reflections_flagged);
+        log_key_u32("  props removed from reflections", r->reflections_skipped);
+    }
+    if (r->cone_status == GU_X_ON) {
+        log_key_u32("Cone updates", r->cone_updates);
+        log_key_u32("Cone props made directly (inside the cone)", r->cone_made_directly);
+        log_key_u32("Cone props parked (outside the cone)", r->cone_parked_total);
+        log_key_u32("Cone parked props made later", r->cone_released_total);
+        log_key_u32("Cone parked props now waiting", r->cone_parked_now);
+        log_key_u32("Cone most waiting at once", r->cone_parked_max);
+        log_key_u32("Cone dropped (provider removed)", r->cone_dropped_removed);
+        log_key_u32("Cone generator resets seen", r->cone_resets);
+        log_key_u32("Cone waiting props cleared by resets", r->cone_dropped_on_reset);
+        log_key_u32("Cone made at once because the waiting list was full", r->cone_overflow_made);
+        log_key_u32("Cone updates after a cut or very fast turn", r->cone_burst_updates);
+        log_key_u32("Cone updates with an untrusted camera", r->cone_invalid_camera);
+        log_key_u32("Cone updates limited by ConeReleasePerUpdate", r->cone_budget_limited);
+        log_key_u32("Cone updates limited by queue room", r->cone_room_limited);
+        log_key_u32("Cone most made from waiting in one update", r->cone_max_released);
+        log_key_u32("Cone largest queue seen at hook entry", r->cone_queue_max);
+    }
+    append_current_log_buffer();
+}
+
 static void write_telemetry_scheduled(
     const struct TelemetrySnapshot *snapshot,
     DWORD sample_number, DWORD high_surface, DWORD high_source)
@@ -7992,9 +8000,49 @@ static void write_telemetry_scheduled(
         write_telemetry_compact(
             snapshot, sample_number, high_surface, high_source);
     }
+    if (sample_number == 1u ||
+        sample_number % TELEMETRY_FULL_SAMPLE_INTERVAL == 0u) {
+        log_extras_runtime(sample_number);
+    }
 }
 
-static void poll_exhaustion_once(void)
+/* Telemetry reads game memory from its own thread, so a page can disappear
+ * between a VirtualQuery check and the read. Contain only memory faults here
+ * (the game thread is never affected) instead of letting them end the host. */
+static volatile LONG g_telemetry_guard_faults;
+
+#if defined(_MSC_VER)
+static int gu_telemetry_exception_filter(DWORD code)
+{
+    return (code == EXCEPTION_ACCESS_VIOLATION ||
+            code == EXCEPTION_IN_PAGE_ERROR) ?
+        EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH;
+}
+#endif
+
+static void telemetry_guard_fault(const char *where)
+{
+    if (InterlockedIncrement(&g_telemetry_guard_faults) == 1) {
+        telemetry_begin_block("TELEMETRY GUARD");
+        log_append("A read of game memory faulted and was contained in: ");
+        log_append(where);
+        log_append(". Telemetry continues; the game was not affected.\r\n");
+        append_current_log_buffer();
+    }
+}
+
+#if defined(_MSC_VER)
+#define GU_GUARDED_TRY __try
+#define GU_GUARDED_EXCEPT(where) \
+    __except (gu_telemetry_exception_filter(GetExceptionCode())) { \
+        telemetry_guard_fault(where); \
+    }
+#else
+#define GU_GUARDED_TRY if (1)
+#define GU_GUARDED_EXCEPT(where) else { (void)(where); }
+#endif
+
+static void poll_exhaustion_once_unguarded(void)
 {
     WORD provider_free;
     WORD surface_free;
@@ -8046,6 +8094,23 @@ static void poll_exhaustion_once(void)
                 SURFACE_NEXT_OFFSET) == 0u) {
         InterlockedExchange(&g_surface_exhaustion_observed, 1);
     }
+}
+
+static void poll_exhaustion_once(void)
+{
+    GU_GUARDED_TRY {
+        poll_exhaustion_once_unguarded();
+    } GU_GUARDED_EXCEPT("poll_exhaustion_once")
+}
+
+static int capture_telemetry_snapshot_guarded(
+    struct TelemetrySnapshot *snapshot)
+{
+    int ok = 0;
+    GU_GUARDED_TRY {
+        ok = capture_telemetry_snapshot(snapshot);
+    } GU_GUARDED_EXCEPT("capture_telemetry_snapshot")
+    return ok;
 }
 
 static void telemetry_polling_wait(DWORD milliseconds)
@@ -9259,7 +9324,7 @@ static void write_tuning_governor_event(void)
         g_report.tuning_governor_state ==
             TUNING_GOVERNOR_STATE_RESTART_REQUIRED);
     log_append(
-        "The 40,960 core procedural-surface pool and the configured bounded "
+        "The configured core procedural-surface pool and the configured bounded "
         "rendered-object capacity remain installed. The monitor performed zero "
         "live writes and did not claim an in-session repair. This launch is a "
         "failed test: exit GTA IV normally, preserve the log, and restart with "
@@ -9830,7 +9895,7 @@ static void capture_early_telemetry(
 {
     struct TelemetrySnapshot snapshot;
 
-    if (!capture_telemetry_snapshot(&snapshot)) {
+    if (!capture_telemetry_snapshot_guarded(&snapshot)) {
         return;
     }
     if (snapshot.surface_active > *high_surface) {
@@ -9967,6 +10032,16 @@ static int wait_for_background_threads_ready(
     return 1;
 }
 
+static void verify_live_state_guarded(void)
+{
+    GU_GUARDED_TRY {
+        verify_definition_scaling_live();
+    } GU_GUARDED_EXCEPT("verify_definition_scaling_live")
+    GU_GUARDED_TRY {
+        verify_procedural_model_draw_distances_live();
+    } GU_GUARDED_EXCEPT("verify_procedural_model_draw_distances_live")
+}
+
 static DWORD WINAPI telemetry_thread_main(LPVOID parameter)
 {
     DWORD sample_number = 0;
@@ -10002,11 +10077,11 @@ static DWORD WINAPI telemetry_thread_main(LPVOID parameter)
             log_append(
                 "Procedural definitions became visible, but the exact "
                 "transaction-installed one-shot callback did not execute "
-                "within 30 seconds. Continuing would falsely claim active "
-                "density scaling; the process is closing fail-closed.\r\n");
+                "within 30 seconds. Density scaling cannot be confirmed; "
+                "telemetry is disabled and the game keeps running.\r\n");
             append_current_log_buffer();
-            TerminateProcess(
-                GetCurrentProcess(), g_report.status);
+            /* Optional observation failure disables telemetry; never close GTA IV. */
+            InterlockedExchange(&g_telemetry_stop, 1);
             return g_report.status;
         }
     }
@@ -10021,9 +10096,8 @@ static DWORD WINAPI telemetry_thread_main(LPVOID parameter)
 
     while (InterlockedCompareExchange(&g_telemetry_stop, 0, 0) == 0) {
         publish_tuning_governor_event_if_pending();
-        if (capture_telemetry_snapshot(&snapshot)) {
-            verify_definition_scaling_live();
-            verify_procedural_model_draw_distances_live();
+        if (capture_telemetry_snapshot_guarded(&snapshot)) {
+            verify_live_state_guarded();
             if (g_report.definition_live_mismatches != 0u) {
                 trigger_tuning_safety_governor(
                     TUNING_GOVERNOR_REASON_DENSITY_MISMATCH,
@@ -10458,7 +10532,7 @@ static int prompt_unrecognized_executable_probe(void)
     g_report.compatibility_probe_prompted = 1u;
     response = MessageBoxA(
         NULL, message,
-        "GTA IV Grass Fix v1.2 - Unrecognized EXE",
+        "GTA IV Grass Fix - Unrecognized EXE",
         MB_YESNO | MB_ICONWARNING | MB_SETFOREGROUND |
             MB_TOPMOST | MB_DEFBUTTON2);
     if (response != IDYES) {
@@ -10491,7 +10565,7 @@ static void show_compatibility_probe_result(void)
             "GTAIV.EFLC.ProceduralFixes.log.");
         MessageBoxA(
             NULL, message,
-            "GTA IV Grass Fix v1.2 - Patch succeeded",
+            "GTA IV Grass Fix - Patch succeeded",
             MB_OK | MB_ICONWARNING | MB_SETFOREGROUND | MB_TOPMOST);
         return;
     }
@@ -10514,7 +10588,7 @@ static void show_compatibility_probe_result(void)
         "\r\nDetails: GTAIV.EFLC.ProceduralFixes.log");
     MessageBoxA(
         NULL, message,
-        "GTA IV Grass Fix v1.2 - Patch failed",
+        "GTA IV Grass Fix - Patch failed",
         MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND | MB_TOPMOST);
 }
 
@@ -10527,7 +10601,7 @@ static void show_disabled_result(void)
     }
     MessageBoxA(
         NULL, build_startup_error_message(),
-        "GTA IV Grass Fix v1.2 - Mod disabled",
+        "GTA IV Grass Fix - Mod disabled",
         MB_OK | MB_ICONWARNING | MB_SETFOREGROUND | MB_TOPMOST);
 }
 #endif
@@ -10576,10 +10650,6 @@ static void capture_module_paths(void)
     make_sibling_path(
         g_self_path, capture_name,
         g_hang_summary_path, MAX_PATH);
-    wsprintfA(capture_name, "%s_events.gfr", capture_stem);
-    make_sibling_path(
-        g_self_path, capture_name,
-        g_flight_recorder_path, MAX_PATH);
     g_existing_crash_dump_at_start =
         GetFileAttributesA(g_crash_dump_path) !=
         INVALID_FILE_ATTRIBUTES;
@@ -11796,139 +11866,6 @@ static LONG WINAPI targeted_provider_exception_logger(
 static LONG WINAPI crash_exception_handler(
     PEXCEPTION_POINTERS exception_pointers);
 
-struct GrassFlightRecorderFileHeader {
-    BYTE magic[8];
-    DWORD schema_version;
-    DWORD header_size;
-    DWORD event_size;
-    DWORD event_count;
-    DWORD first_sequence;
-    DWORD next_sequence;
-    DWORD lost_while_frozen;
-    DWORD capture_reason;
-    DWORD process_id;
-    DWORD executable_identity_id;
-    DWORD distance_multiplier_bits;
-    DWORD plant_density_multiplier_bits;
-    DWORD procobj_density_multiplier_bits;
-    DWORD density_class_mask;
-    SYSTEMTIME captured_utc;
-    char build_id[16];
-    char catalog_sha256[65];
-    char executable_sha256[65];
-    char asi_sha256[65];
-    char ini_sha256[65];
-};
-
-static void capture_flight_recorder_snapshot(DWORD reason)
-{
-    if (InterlockedCompareExchange(
-            &g_flight_snapshot_ready, 1, 0) != 0) {
-        return;
-    }
-    g_flight_snapshot_reason = reason;
-    gu_flight_recorder_freeze(&g_gu_flight_recorder);
-    g_flight_snapshot_count = gu_flight_recorder_snapshot(
-        &g_gu_flight_recorder, g_flight_snapshot,
-        GU_FLIGHT_RECORDER_CAPACITY,
-        &g_flight_snapshot_first_sequence,
-        &g_flight_snapshot_next_sequence,
-        &g_flight_snapshot_lost_frozen);
-}
-
-static int write_flight_recorder_snapshot(void)
-{
-    struct GrassFlightRecorderFileHeader header;
-    HANDLE file;
-    DWORD written;
-    DWORD event_bytes;
-    if (InterlockedCompareExchange(
-            &g_flight_snapshot_ready, 0, 0) == 0) {
-        return 0;
-    }
-    if (g_flight_snapshot_count >
-            0xFFFFFFFFu / sizeof(struct GuRawEvent)) {
-        return 0;
-    }
-    ZeroMemory(&header, sizeof(header));
-    header.magic[0] = 'G';
-    header.magic[1] = 'R';
-    header.magic[2] = 'G';
-    header.magic[3] = 'F';
-    header.magic[4] = 'R';
-    header.magic[5] = '1';
-    header.schema_version = 1u;
-    header.header_size = sizeof(header);
-    header.event_size = sizeof(struct GuRawEvent);
-    header.event_count = g_flight_snapshot_count;
-    header.first_sequence = g_flight_snapshot_first_sequence;
-    header.next_sequence = g_flight_snapshot_next_sequence;
-    header.lost_while_frozen = g_flight_snapshot_lost_frozen;
-    header.capture_reason = g_flight_snapshot_reason;
-    header.process_id = GetCurrentProcessId();
-    header.executable_identity_id = g_report.executable_identity_id;
-    header.distance_multiplier_bits =
-        g_report.corrected_distance_multiplier_bits;
-    header.plant_density_multiplier_bits =
-        g_report.corrected_plant_density_multiplier_bits;
-    header.procobj_density_multiplier_bits =
-        g_report.procobj_density_multiplier_bits;
-    header.density_class_mask = g_report.density_class_mask;
-    GetSystemTime(&header.captured_utc);
-    copy_string(header.build_id, sizeof(header.build_id), "GRASS-BLD-0050");
-    copy_string(
-        header.catalog_sha256, sizeof(header.catalog_sha256),
-        GTAIV_GRASS_COMPAT_CATALOG_SHA256);
-    copy_string(
-        header.executable_sha256, sizeof(header.executable_sha256),
-        g_main_sha256);
-    copy_string(header.asi_sha256, sizeof(header.asi_sha256), g_self_sha256);
-    copy_string(header.ini_sha256, sizeof(header.ini_sha256), g_ini_sha256);
-    file = CreateFileA(
-        g_flight_recorder_path, GENERIC_WRITE, FILE_SHARE_READ,
-        NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (file == INVALID_HANDLE_VALUE) {
-        return 0;
-    }
-    written = 0u;
-    if (!WriteFile(file, &header, sizeof(header), &written, NULL) ||
-        written != sizeof(header)) {
-        CloseHandle(file);
-        return 0;
-    }
-    event_bytes = g_flight_snapshot_count * sizeof(struct GuRawEvent);
-    if (event_bytes != 0u &&
-        (!WriteFile(
-            file, g_flight_snapshot, event_bytes, &written, NULL) ||
-         written != event_bytes)) {
-        CloseHandle(file);
-        return 0;
-    }
-    FlushFileBuffers(file);
-    CloseHandle(file);
-    return 1;
-}
-
-/*
- * Registered from the post-loader-lock startup worker. The CRT invokes this
- * before DLL_PROCESS_DETACH on an ordinary return/exit path, so the final
- * bounded recorder snapshot is written without doing file I/O in DllMain.
- * Crash and forced-process termination paths remain covered by their own
- * handlers and do not depend on this callback.
- */
-static void __cdecl flush_flight_recorder_on_clean_exit(void)
-{
-    capture_flight_recorder_snapshot(3u);
-    (void)write_flight_recorder_snapshot();
-}
-
-__declspec(dllexport) DWORD __cdecl
-GTAIVEFLCProceduralFixes_FlushDiagnosticFlightRecorder(void)
-{
-    capture_flight_recorder_snapshot(4u);
-    return (DWORD)write_flight_recorder_snapshot();
-}
-
 static LONG continue_unhandled_chain(
     PEXCEPTION_POINTERS exception_pointers)
 {
@@ -11959,10 +11896,7 @@ static LONG WINAPI crash_exception_handler(
         InterlockedCompareExchange(&g_crash_dump_started, 1, 0) != 0) {
         return continue_unhandled_chain(exception_pointers);
     }
-
-    capture_flight_recorder_snapshot(1u);
     if (!g_mini_dump_write_dump) {
-        (void)write_flight_recorder_snapshot();
         append_crash_diagnostics(
             exception_pointers, "DBGHELP_LOAD_FAILED",
             0u, 0u, ERROR_PROC_NOT_FOUND);
@@ -11973,7 +11907,6 @@ static LONG WINAPI crash_exception_handler(
         g_crash_dump_path, GENERIC_WRITE, FILE_SHARE_READ, NULL,
         CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
     if (dump_file == INVALID_HANDLE_VALUE) {
-        (void)write_flight_recorder_snapshot();
         append_crash_diagnostics(
             exception_pointers, "DUMP_FILE_CREATE_FAILED",
             0u, 0u, GetLastError());
@@ -12006,7 +11939,6 @@ static LONG WINAPI crash_exception_handler(
             dump_error = GetLastError();
         }
     }
-    (void)write_flight_recorder_snapshot();
     append_crash_diagnostics(
         exception_pointers,
         dump_result ? "DUMP_WRITTEN" : "DUMP_WRITE_FAILED",
@@ -12362,12 +12294,10 @@ static BOOL write_hang_dump(
     if (dump_error) {
         *dump_error = 0u;
     }
-    capture_flight_recorder_snapshot(2u);
     if (!g_mini_dump_write_dump) {
         if (dump_error) {
             *dump_error = ERROR_PROC_NOT_FOUND;
         }
-        (void)write_flight_recorder_snapshot();
         append_hang_diagnostics(
             "DBGHELP_LOAD_FAILED", failed_probes, probe_error,
             0u, 0u, dump_error ? *dump_error : 0u);
@@ -12381,7 +12311,6 @@ static BOOL write_hang_dump(
         if (dump_error) {
             *dump_error = GetLastError();
         }
-        (void)write_flight_recorder_snapshot();
         append_hang_diagnostics(
             "HANG_DUMP_FILE_CREATE_FAILED", failed_probes, probe_error,
             0u, 0u, dump_error ? *dump_error : 0u);
@@ -12418,7 +12347,6 @@ static BOOL write_hang_dump(
     if (used_dump_type) {
         *used_dump_type = dump_type;
     }
-    (void)write_flight_recorder_snapshot();
     append_hang_diagnostics(
         dump_result ? "HANG_DUMP_WRITTEN" : "HANG_DUMP_WRITE_FAILED",
         failed_probes, probe_error, dump_type,
@@ -12878,6 +12806,82 @@ static void release_unpublished_prior_feature_allocations(void)
 }
 #endif
 
+/* ---- optional extras (matrix limit, reflections, cone back) ---------- */
+static DWORD read_extras_u32(const char *key, DWORD fallback, DWORD minimum, DWORD maximum)
+{
+    char text[32];
+    DWORD length = GetPrivateProfileStringA(
+        "ProceduralPool", key, "", text, sizeof(text), g_ini_path);
+    DWORD value = 0u, i;
+    if (length == 0u || length >= sizeof(text) - 1u) return fallback;
+    for (i = 0u; i < length; ++i) {
+        if (text[i] < '0' || text[i] > '9') return fallback;
+        value = value * 10u + (DWORD)(text[i] - '0');
+        if (value > 1000000u) return fallback;
+    }
+    return (value < minimum || value > maximum) ? fallback : value;
+}
+
+static int extras_is_prop_entity(uint32_t entity)
+{
+    return gu_ownership_find_entity(
+        &g_gu_ownership, (DWORD)entity, NULL, NULL) != 0;
+}
+
+static int extras_addr_busy(uint32_t start, uint32_t length, void *context)
+{
+    const struct GuStartupQuiescence *guard =
+        (const struct GuStartupQuiescence *)context;
+    DWORD i;
+    if (!guard) return 1;
+    for (i = 0u; i < guard->count && i < GU_STARTUP_MAX_THREADS; ++i) {
+        CONTEXT thread_context;
+        if (!guard->live[i]) continue;
+        thread_context.ContextFlags = CONTEXT_CONTROL;
+        if (!GetThreadContext(guard->handles[i], &thread_context)) return 1;
+        if (thread_context.Eip + 16u > start && thread_context.Eip < start + length + 16u)
+            return 1;
+    }
+    return 0;
+}
+
+static void install_extras(struct GuStartupQuiescence *guard, BYTE *image_base)
+{
+    struct GuExtrasConfig config;
+    config.matrix_limit = read_extras_u32("GeneratorMatrixLimit", 0u, 513u, 4096u);
+    config.matrix_pool = read_extras_u32("GeneratorMatrixPool", 0u, 7000u, 65536u);
+    config.reflections_props = read_extras_u32("PropsInWaterReflections", 1u, 0u, 1u);
+    config.cone_back_meters = read_extras_u32("ConeBack", 0u, 20u, 1000u);
+    config.cone_full_angle_deg = read_extras_u32("ConeFullAngle", 75u, 30u, 120u);
+    config.cone_release_per_update = read_extras_u32("ConeReleasePerUpdate", 384u, 0u, 8192u);
+    config.cone_lead_ms = read_extras_u32("ConeTurnLeadMs", 300u, 0u, 1000u);
+    config.is_prop_entity = extras_is_prop_entity;
+    (void)gu_extras_install(&config, image_base, g_build_profile->image_size,
+                            g_manager, extras_addr_busy, guard);
+}
+
+static void log_extras_report(void)
+{
+    const struct GuExtrasReport *r = &g_gu_extras_report;
+    DWORD i;
+    log_append("\r\n[EXTRAS]\r\n");
+    log_key_u32("Matrix status (0 off, 1 on, 2 site, 3 busy, 4 memory, 5 write)", r->matrix_status);
+    log_key_u32("Matrix limit applied", r->matrix_limit_applied);
+    log_key_u32("Matrix pool applied", r->matrix_pool_applied);
+    log_key_u32("Matrix limit sites in original form (0 = already raised by the main fix)", r->matrix_limit_sites_original);
+    log_key_u32("Reflections status", r->reflections_status);
+    log_key_u32("Cone status (6 camera, 7 config)", r->cone_status);
+    for (i = 0u; i < r->sites_known && i < GU_X_SITE_COUNT; ++i) {
+        if (r->site_matches[i] == 0u && r->site_rva[i] == 0u) continue;
+        log_append(r->site_name[i] ? r->site_name[i] : "site");
+        log_append(" matches: ");
+        log_append_u32(r->site_matches[i]);
+        log_append(" RVA: ");
+        log_append_hex32(r->site_rva[i]);
+        log_append("\r\n");
+    }
+}
+
 static void run_patch(void)
 {
     BYTE *image_base;
@@ -13049,7 +13053,7 @@ static void run_patch(void)
     hang_message_box_enabled = DEFAULT_HANG_MESSAGE_BOX;
     full_hang_dump_enabled = DEFAULT_FULL_HANG_DUMP;
     if (!read_ini_float_strict_default(
-            "DistanceMultiplier", "1.0",
+            "DistanceMultiplier", "1.25",
             MIN_CORRECTED_DISTANCE_MULTIPLIER,
             MAX_CORRECTED_DISTANCE_MULTIPLIER,
             &corrected_distance_multiplier) ||
@@ -14133,6 +14137,8 @@ static void run_patch(void)
     g_report.universal_behavior_failure_stage =
         (DWORD)InterlockedCompareExchange(
             &g_gu_install.failure_stage, 0, 0);
+    /* optional, opt-in additions: never able to fail the install above */
+    install_extras(&startup_guard, image_base);
     if (!startup_quiescence_end(&startup_guard)) {
         return;
     }
@@ -14161,8 +14167,15 @@ startup_write_failure:
         g_report.universal_behavior_rollback_verified =
             universal_restored && prior_restored;
         if (!universal_restored || !prior_restored) {
-            startup_quiescence_terminate_now(
-                STATUS_UNIVERSAL_BEHAVIOR_ROLLBACK_FAILED);
+            /* The host process is never terminated. Patched code may still
+             * point into the prepared stubs and pools, so they must NOT be
+             * cancelled or released: retain them until process exit, resume
+             * the stopped threads, and keep the failure status. */
+            if (startup_guard_active) {
+                (void)startup_quiescence_end(&startup_guard);
+            }
+            g_report.status = STATUS_UNIVERSAL_BEHAVIOR_ROLLBACK_FAILED;
+            return;
         }
         if (startup_guard_active &&
             !startup_quiescence_end(&startup_guard)) {
@@ -14332,2430 +14345,8 @@ GTAIVEFLCProceduralFixes_GetBuildProfileContractHash(DWORD index)
     return build_profile_contract_hash(&g_build_profiles[index]);
 }
 
-DWORD __cdecl
-GTAIVEFLCProceduralFixes_RunBuildProfileRegistryFixture(void)
-{
-    DWORD index;
-    DWORD other;
-    const struct ExecutableIdentity *new_identity;
 
-    if (g_build_profile_count != GTAIV_GRASS_MAIN_PROFILE_COUNT ||
-        GTAIV_GRASS_MAIN_PROFILE_COUNT != 9u) {
-        return 0u;
-    }
-    for (index = 0u; index < g_build_profile_count; ++index) {
-        const struct BuildProfile *profile = &g_build_profiles[index];
-        DWORD provider_index;
-        int provider_contract_valid = 0;
-
-        if (profile->provider_supported) {
-            provider_contract_valid =
-                (profile->provider_patch_variant ==
-                     PROVIDER_PATCH_VARIANT_CE ||
-                 profile->provider_patch_variant ==
-                     PROVIDER_PATCH_VARIANT_PATCH8) &&
-                profile->provider_patch_count != 0u &&
-                profile->provider_patch_count <=
-                    PROVIDER_PATCH_CAPACITY - 2u &&
-                profile->provider_head_quarantine_rva != 0u &&
-                profile->provider_rebuild_epilogue_rva != 0u;
-        } else if (profile->provider_patch_variant == 0u &&
-                   profile->provider_patch_count == 0u &&
-                   profile->provider_manager_rva == 0u &&
-                   profile->provider_next_index_rva == 0u &&
-                   profile->provider_record_index_rva == 0u &&
-                   profile->provider_head_quarantine_rva == 0u &&
-                   profile->provider_rebuild_epilogue_rva == 0u) {
-            provider_contract_valid = 1;
-            for (provider_index = 0u;
-                 provider_index < PROVIDER_PATCH_CAPACITY;
-                 ++provider_index) {
-                if (profile->provider_sites[provider_index] != 0u) {
-                    provider_contract_valid = 0;
-                    break;
-                }
-            }
-        }
-
-        if (profile->id != index + 1u ||
-            !profile->name || profile->name[0] == '\0' ||
-            profile->pe_timestamp == 0u ||
-            profile->image_size == 0u ||
-            (profile->code_variant != BUILD_CODE_CE &&
-             profile->code_variant != BUILD_CODE_PATCH8) ||
-            profile->target_pattern_length == 0u ||
-            profile->manager_rva == 0u ||
-            profile->definition_manager_rva == 0u ||
-            profile->model_info_table_rva == 0u ||
-            profile->definition_call_rva == 0u ||
-            profile->generator_manager_rva == 0u ||
-            profile->generator_allocator_rva == 0u ||
-            profile->generator_staging_alloc_rva == 0u ||
-            profile->generator_staging_cap_rva == 0u ||
-            profile->procedural_code_first_rva >=
-                profile->procedural_code_last_rva ||
-            profile->generator_code_first_rva >=
-                profile->generator_code_last_rva ||
-            profile->source_code_first_rva >=
-                profile->source_code_last_rva ||
-            !provider_contract_valid ||
-            find_build_profile_by_id(profile->id) != profile) {
-            return 0u;
-        }
-        for (other = index + 1u;
-             other < g_build_profile_count;
-             ++other) {
-            if (profile->id == g_build_profiles[other].id) {
-                return 0u;
-            }
-        }
-    }
-    if (g_build_profiles[0].pe_timestamp != 0x63D3E735u ||
-        g_build_profiles[0].image_size != 0x01BE6400u ||
-        g_build_profiles[1].pe_timestamp != 0x5ED51FD0u ||
-        g_build_profiles[1].image_size != 0x01BE6400u ||
-        g_build_profiles[2].pe_timestamp != 0x57C6FB75u ||
-        g_build_profiles[2].image_size != 0x018B2000u ||
-        g_build_profiles[3].pe_timestamp != 0x63D3E735u ||
-        g_build_profiles[3].image_size != 0x01AEB000u ||
-        g_build_profiles[4].pe_timestamp != 0x63D3E735u ||
-        g_build_profiles[4].image_size != 0x01BE6400u ||
-        g_build_profiles[5].pe_timestamp != 0x63D3E735u ||
-        g_build_profiles[5].image_size != 0x01AEB000u ||
-        g_build_profiles[6].pe_timestamp != 0x4BD9EFBEu ||
-        g_build_profiles[6].image_size != 0x01851000u ||
-        g_build_profiles[7].pe_timestamp != 0x4A1AE9B0u ||
-        g_build_profiles[7].image_size != 0x01679000u ||
-        g_build_profiles[8].id != 9u ||
-        g_build_profiles[8].pe_timestamp != 0x57C6FB75u ||
-        g_build_profiles[8].image_size != 0x018C8000u ||
-        !generator_expansion_supported_for_profile(9u) ||
-        !generator_expansion_supported_for_profile(5u) ||
-        !generator_expansion_supported_for_profile(6u) ||
-        !generator_expansion_supported_for_profile(7u) ||
-        !generator_expansion_supported_for_profile(8u)) {
-        return 0u;
-    }
-    new_identity = select_executable_identity(
-        "2D230E3C00327A7D618CF9EDC6EE6E7C30C6C8944E942AA955FF692BFFD75E05",
-        15718808u);
-    if (!new_identity || new_identity->id != 13u ||
-        new_identity->build_profile_id != 9u) {
-        return 0u;
-    }
-    return 1u;
-}
-
-static DWORD executable_identity_contract_hash(
-    const struct ExecutableIdentity *identity)
-{
-    DWORD hash = 2166136261u;
-    const BYTE *text = (const BYTE *)identity->evidence_label;
-    while (*text) {
-        hash = build_profile_hash_byte(hash, *text++);
-    }
-    hash = build_profile_hash_byte(hash, 0u);
-    text = (const BYTE *)identity->sha256;
-    while (*text) {
-        hash = build_profile_hash_byte(hash, *text++);
-    }
-    hash = build_profile_hash_byte(hash, 0u);
-    hash = build_profile_hash_u32(hash, identity->id);
-    hash = build_profile_hash_u32(hash, identity->file_size);
-    return build_profile_hash_u32(hash, identity->build_profile_id);
-}
-
-DWORD __cdecl
-GTAIVEFLCProceduralFixes_GetExecutableIdentityCount(void)
-{
-    return g_executable_identity_count;
-}
-
-DWORD __cdecl
-GTAIVEFLCProceduralFixes_GetExecutableIdentityContractHash(DWORD index)
-{
-    if (index >= g_executable_identity_count) {
-        return 0u;
-    }
-    return executable_identity_contract_hash(
-        &g_executable_identities[index]);
-}
-
-DWORD __cdecl
-GTAIVEFLCProceduralFixes_RunExecutableIdentityRegistryFixture(void)
-{
-    DWORD index;
-    DWORD other;
-    if (g_executable_identity_count != GTAIV_GRASS_COMPAT_TARGET_COUNT) {
-        return 0u;
-    }
-    for (index = 0u; index < g_executable_identity_count; ++index) {
-        const struct ExecutableIdentity *identity =
-            &g_executable_identities[index];
-        DWORD character;
-        if (!identity->evidence_label ||
-            identity->evidence_label[0] == '\0' ||
-            !identity->sha256 ||
-            string_length(identity->sha256) != 64u ||
-            identity->file_size == 0u ||
-            !find_build_profile_by_id(identity->build_profile_id) ||
-            select_executable_identity(
-                identity->sha256,
-                identity->file_size) != identity ||
-            select_executable_identity(
-                identity->sha256,
-                identity->file_size + 1u) != NULL) {
-            return 0u;
-        }
-        for (character = 0u; character < 64u; ++character) {
-            char value = identity->sha256[character];
-            if (!((value >= '0' && value <= '9') ||
-                  (value >= 'A' && value <= 'F'))) {
-                return 0u;
-            }
-        }
-        for (other = index + 1u;
-             other < g_executable_identity_count;
-             ++other) {
-            if (strings_are_equal(
-                    identity->sha256,
-                    g_executable_identities[other].sha256)) {
-                return 0u;
-            }
-        }
-    }
-    if (select_executable_identity(
-            "0000000000000000000000000000000000000000000000000000000000000001",
-            17425752u) != NULL) {
-        return 0u;
-    }
-    return 1u;
-}
-
-DWORD __cdecl
-GTAIVEFLCProceduralFixes_RunBehaviorAxisIsolationFixture(void)
-{
-    const DWORD neutral = 0x3F800000u;
-    const DWORD distance_non_neutral = 0x3FC00000u;
-    const DWORD density_non_neutral = 0x40000000u;
-    return behavior_axis_non_neutral_count(
-            neutral, neutral, neutral) == 0u &&
-        behavior_axis_non_neutral_count(
-            distance_non_neutral, neutral, neutral) == 1u &&
-        behavior_axis_non_neutral_count(
-            neutral, density_non_neutral, neutral) == 1u &&
-        behavior_axis_non_neutral_count(
-            neutral, neutral, density_non_neutral) == 1u &&
-        behavior_axis_non_neutral_count(
-            distance_non_neutral, density_non_neutral, neutral) == 2u &&
-        behavior_axis_non_neutral_count(
-            distance_non_neutral, neutral, density_non_neutral) == 2u &&
-        behavior_axis_non_neutral_count(
-            neutral, density_non_neutral, density_non_neutral) == 2u &&
-        behavior_axis_non_neutral_count(
-            distance_non_neutral,
-            density_non_neutral,
-            density_non_neutral) == 3u &&
-        strings_are_equal(
-            status_text(STATUS_BEHAVIOR_AXIS_ISOLATION_REFUSED),
-            "BEHAVIOR_AXIS_ISOLATION_REFUSED_MULTIPLE_NON_NEUTRAL_AXES");
-}
-
-DWORD __cdecl
-GTAIVEFLCProceduralFixes_RunCapacityPatchTransactionFixture(void)
-{
-    struct PatchReport saved_report = g_report;
-    LONG saved_transaction_dirty = InterlockedCompareExchange(
-        &g_capacity_patch_transaction_dirty, 0, 0);
-#ifdef GTAIVPOOL_TEST_NO_FATAL
-    LONG saved_restore_failures = InterlockedCompareExchange(
-        &g_fixture_patch_protection_restore_failures, 0, 0);
-#endif
-    BYTE *storage = NULL;
-    DWORD old_protection = 0u;
-    DWORD requested = 40960u;
-    DWORD result = 0u;
-    MEMORY_BASIC_INFORMATION page_info;
-
-    storage = (BYTE *)VirtualAlloc(
-        NULL, 4096u,
-        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    if (!storage) {
-        goto cleanup;
-    }
-    write_u32(storage, VANILLA_CAPACITY);
-
-    ZeroMemory(&g_report, sizeof(g_report));
-    InterlockedExchange(&g_capacity_patch_transaction_dirty, 0);
-    if (!apply_capacity_patch_transaction(storage, requested) ||
-        read_u32(storage) != requested ||
-        InterlockedCompareExchange(
-            &g_capacity_patch_transaction_dirty, 0, 0) != 0 ||
-        !rollback_capacity_after_downstream_failure(storage) ||
-        read_u32(storage) != VANILLA_CAPACITY ||
-        InterlockedCompareExchange(
-            &g_capacity_patch_transaction_dirty, 0, 0) != 0 ||
-        VirtualQuery(storage, &page_info, sizeof(page_info)) !=
-            sizeof(page_info) ||
-        page_info.Protect != PAGE_READWRITE) {
-        goto cleanup;
-    }
-
-    /* A dirty half-written immediate must also be fully reverted. */
-    ZeroMemory(&g_report, sizeof(g_report));
-    if (!VirtualProtect(
-            storage, 4u, PAGE_EXECUTE_READWRITE,
-            &old_protection)) {
-        goto cleanup;
-    }
-    g_report.old_protection = old_protection;
-    storage[0] = (BYTE)(requested & 0xFFu);
-    storage[1] = (BYTE)((requested >> 8) & 0xFFu);
-    g_report.final_immediate = read_u32(storage);
-    InterlockedExchange(&g_capacity_patch_transaction_dirty, 1);
-    if (!rollback_capacity_patch_writable(
-            storage, old_protection) ||
-        read_u32(storage) != VANILLA_CAPACITY ||
-        InterlockedCompareExchange(
-            &g_capacity_patch_transaction_dirty, 0, 0) != 0 ||
-        VirtualQuery(storage, &page_info, sizeof(page_info)) !=
-            sizeof(page_info) ||
-        page_info.Protect != old_protection) {
-        goto cleanup;
-    }
-
-#ifdef GTAIVPOOL_TEST_NO_FATAL
-    /* The first failed restore must force a byte rollback and a retry. */
-    ZeroMemory(&g_report, sizeof(g_report));
-    InterlockedExchange(
-        &g_fixture_patch_protection_restore_failures, 1);
-    if (apply_capacity_patch_transaction(storage, requested) ||
-        g_report.status != STATUS_PROTECTION_RESTORE_FAILED ||
-        read_u32(storage) != VANILLA_CAPACITY ||
-        InterlockedCompareExchange(
-            &g_capacity_patch_transaction_dirty, 0, 0) != 0 ||
-        InterlockedCompareExchange(
-            &g_fixture_patch_protection_restore_failures,
-            0, 0) != 0 ||
-        VirtualQuery(storage, &page_info, sizeof(page_info)) !=
-            sizeof(page_info) ||
-        page_info.Protect != PAGE_READWRITE) {
-        goto cleanup;
-    }
-#endif
-    result = 1u;
-
-cleanup:
-    if (storage) {
-        VirtualFree(storage, 0u, MEM_RELEASE);
-    }
-    g_report = saved_report;
-    InterlockedExchange(
-        &g_capacity_patch_transaction_dirty,
-        saved_transaction_dirty);
-#ifdef GTAIVPOOL_TEST_NO_FATAL
-    InterlockedExchange(
-        &g_fixture_patch_protection_restore_failures,
-        saved_restore_failures);
-#endif
-    return result;
-}
-
-static int sha256_test_vector(
-    const BYTE *input, DWORD input_length, const char *expected)
-{
-    static const char hex[] = "0123456789ABCDEF";
-    struct Sha256Context context;
-    BYTE digest[32];
-    char actual[65];
-    DWORD index;
-    sha256_initialize(&context);
-    sha256_update(&context, input, input_length);
-    sha256_finish(&context, digest);
-    for (index = 0u; index < 32u; ++index) {
-        actual[index * 2u] = hex[digest[index] >> 4];
-        actual[index * 2u + 1u] = hex[digest[index] & 0x0Fu];
-    }
-    actual[64] = '\0';
-    return strings_are_equal(actual, expected);
-}
-
-DWORD __cdecl
-GTAIVEFLCProceduralFixes_RunSha256Fixture(void)
-{
-    static const BYTE empty[] = {0u};
-    static const BYTE abc[] = {'a', 'b', 'c'};
-    return sha256_test_vector(
-            empty, 0u,
-            "E3B0C44298FC1C149AFBF4C8996FB924"
-            "27AE41E4649B934CA495991B7852B855") &&
-        sha256_test_vector(
-            abc, sizeof(abc),
-            "BA7816BF8F01CFEA414140DE5DAE2223"
-            "B00361A396177A9CB410FF61F20015AD");
-}
-
-DWORD __cdecl
-GTAIVEFLCProceduralFixes_RunLockedIdentityFixture(void)
-{
-    static const BYTE abc[] = {'a', 'b', 'c'};
-    static const char expected_sha256[] =
-        "BA7816BF8F01CFEA414140DE5DAE2223"
-        "B00361A396177A9CB410FF61F20015AD";
-    char temp_directory[MAX_PATH];
-    char temp_path[MAX_PATH];
-    struct LockedFileIdentity identity;
-    HANDLE writer = INVALID_HANDLE_VALUE;
-    HANDLE competing_writer = INVALID_HANDLE_VALUE;
-    DWORD written = 0u;
-    DWORD temp_length;
-    DWORD sharing_error;
-    char saved_hash_character;
-    DWORD result = 0u;
-
-    ZeroMemory(&identity, sizeof(identity));
-    temp_directory[0] = '\0';
-    temp_path[0] = '\0';
-    temp_length = GetTempPathA(MAX_PATH, temp_directory);
-    if (temp_length == 0u || temp_length >= MAX_PATH ||
-        !GetTempFileNameA(
-            temp_directory, "GUI", 0u, temp_path)) {
-        goto cleanup;
-    }
-    writer = CreateFileA(
-        temp_path, GENERIC_WRITE, 0u, NULL, CREATE_ALWAYS,
-        FILE_ATTRIBUTE_TEMPORARY, NULL);
-    if (writer == INVALID_HANDLE_VALUE ||
-        !WriteFile(
-            writer, abc, sizeof(abc), &written, NULL) ||
-        written != sizeof(abc) || !FlushFileBuffers(writer)) {
-        goto cleanup;
-    }
-    CloseHandle(writer);
-    writer = INVALID_HANDLE_VALUE;
-
-    if (!acquire_locked_file_identity(temp_path, &identity) ||
-        identity.file_size != sizeof(abc) ||
-        !strings_are_equal(identity.sha256, expected_sha256) ||
-        !revalidate_locked_file_identity(temp_path, &identity)) {
-        goto cleanup;
-    }
-
-    SetLastError(NO_ERROR);
-    competing_writer = CreateFileA(
-        temp_path, GENERIC_WRITE,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    sharing_error = GetLastError();
-    if (competing_writer != INVALID_HANDLE_VALUE ||
-        sharing_error != ERROR_SHARING_VIOLATION) {
-        goto cleanup;
-    }
-
-    saved_hash_character = identity.sha256[0];
-    identity.sha256[0] =
-        saved_hash_character == '0' ? '1' : '0';
-    if (revalidate_locked_file_identity(temp_path, &identity)) {
-        goto cleanup;
-    }
-    identity.sha256[0] = saved_hash_character;
-    if (!revalidate_locked_file_identity(temp_path, &identity)) {
-        goto cleanup;
-    }
-
-    close_locked_file_identity(&identity);
-    competing_writer = CreateFileA(
-        temp_path, GENERIC_WRITE, 0u, NULL, OPEN_EXISTING,
-        FILE_ATTRIBUTE_NORMAL, NULL);
-    if (competing_writer == INVALID_HANDLE_VALUE) {
-        goto cleanup;
-    }
-    result = 1u;
-
-cleanup:
-    if (writer != INVALID_HANDLE_VALUE) {
-        CloseHandle(writer);
-    }
-    if (competing_writer != INVALID_HANDLE_VALUE) {
-        CloseHandle(competing_writer);
-    }
-    close_locked_file_identity(&identity);
-    if (temp_path[0]) {
-        DeleteFileA(temp_path);
-    }
-    return result;
-}
-
-const char *__cdecl
-GTAIVEFLCProceduralFixes_BuildStartupErrorFixture(
-    DWORD status, DWORD site, DWORD byte_offset)
-{
-    struct PatchReport saved_report = g_report;
-    g_report.status = status;
-    g_report.provider_first_mismatch_site = site;
-    g_report.provider_first_mismatch_byte = byte_offset;
-    g_report.generator_first_mismatch_site = site;
-    g_report.generator_first_mismatch_byte = byte_offset;
-    build_startup_error_message();
-    g_report = saved_report;
-    return g_startup_error_message;
-}
-
-DWORD __cdecl
-GTAIVEFLCProceduralFixes_RunGeneratorAllocatorFixture(void)
-{
-    struct PatchReport saved_report = g_report;
-    BYTE *saved_manager = g_generator_manager;
-    BYTE *saved_records = g_generator_extra_records;
-    DWORD saved_record_count =
-        g_generator_extra_record_count;
-    DWORD saved_capacity =
-        g_generator_render_capacity;
-    void *(*saved_pop)(void) =
-        g_generator_builtin_pop;
-    LONG saved_issued = InterlockedCompareExchange(
-        &g_generator_extra_issued, 0, 0);
-    LONG saved_exhausted = InterlockedCompareExchange(
-        &g_generator_extra_exhaustion_observed, 0, 0);
-    LONG saved_calls = InterlockedCompareExchange(
-        &g_generator_fallback_calls, 0, 0);
-    BYTE *fake_manager = NULL;
-    BYTE builtins[GENERATOR_RECORD_SIZE * 2u];
-    void *first;
-    void *second;
-    void *external0;
-    void *reused_external0;
-    void *external1;
-    void *external2;
-    void *exhausted;
-    BYTE *test_storage = NULL;
-    DWORD result = 0u;
-
-    fake_manager = (BYTE *)VirtualAlloc(
-        NULL, GENERATOR_MANAGER_MINIMUM_SIZE,
-        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    if (!fake_manager) {
-        goto cleanup;
-    }
-    ZeroMemory(
-        fake_manager, GENERATOR_MANAGER_MINIMUM_SIZE);
-    ZeroMemory(builtins, sizeof(builtins));
-    write_u32(
-        builtins,
-        (DWORD)(builtins + GENERATOR_RECORD_SIZE));
-    write_u32(
-        builtins + GENERATOR_RECORD_SIZE + 4u,
-        (DWORD)builtins);
-    write_u32(
-        fake_manager + GENERATOR_FREE_COUNT_OFFSET,
-        2u);
-    write_u32(
-        fake_manager + GENERATOR_FREE_HEAD_OFFSET,
-        (DWORD)builtins);
-    write_u32(
-        fake_manager + GENERATOR_FREE_LIST_OFFSET + 8u,
-        (DWORD)(builtins + GENERATOR_RECORD_SIZE));
-
-    ZeroMemory(&g_report, sizeof(g_report));
-    g_generator_manager = fake_manager;
-    g_generator_builtin_pop =
-        (void *(*)(void))generator_fixture_pop;
-    if (!initialize_generator_storage(
-            VANILLA_RENDERED_OBJECT_CAPACITY + 3u)) {
-        goto cleanup;
-    }
-    test_storage = g_generator_extra_records;
-
-    first = generator_pop_hook_c(fake_manager);
-    second = generator_pop_hook_c(fake_manager);
-    external0 = generator_pop_hook_c(fake_manager);
-
-    /*
-     * Emulate GTA IV's unchanged 0x00C0A990 release path by putting the
-     * first external record back in the original intrusive free list.
-     */
-    write_u32((BYTE *)external0, 0u);
-    write_u32((BYTE *)external0 + 4u, 0u);
-    write_u32(
-        fake_manager + GENERATOR_FREE_COUNT_OFFSET,
-        1u);
-    write_u32(
-        fake_manager + GENERATOR_FREE_HEAD_OFFSET,
-        (DWORD)external0);
-    write_u32(
-        fake_manager + GENERATOR_FREE_LIST_OFFSET + 8u,
-        (DWORD)external0);
-
-    reused_external0 =
-        generator_pop_hook_c(fake_manager);
-    external1 = generator_pop_hook_c(fake_manager);
-    external2 = generator_pop_hook_c(fake_manager);
-    exhausted = generator_pop_hook_c(fake_manager);
-
-    if (first != builtins ||
-        second != builtins + GENERATOR_RECORD_SIZE ||
-        external0 != test_storage ||
-        reused_external0 != external0 ||
-        external1 != test_storage + GENERATOR_RECORD_SIZE ||
-        external2 !=
-            test_storage + GENERATOR_RECORD_SIZE * 2u ||
-        exhausted != NULL ||
-        InterlockedCompareExchange(
-            &g_generator_extra_issued, 0, 0) != 3 ||
-        InterlockedCompareExchange(
-            &g_generator_fallback_calls, 0, 0) != 4 ||
-        InterlockedCompareExchange(
-            &g_generator_extra_exhaustion_observed,
-            0, 0) != 1) {
-        goto cleanup;
-    }
-    result = 1u;
-
-cleanup:
-    if (test_storage) {
-        VirtualFree(test_storage, 0, MEM_RELEASE);
-    }
-    if (fake_manager) {
-        VirtualFree(fake_manager, 0, MEM_RELEASE);
-    }
-    g_generator_manager = saved_manager;
-    g_generator_extra_records = saved_records;
-    g_generator_extra_record_count =
-        saved_record_count;
-    g_generator_render_capacity = saved_capacity;
-    g_generator_builtin_pop = saved_pop;
-    InterlockedExchange(
-        &g_generator_extra_issued, saved_issued);
-    InterlockedExchange(
-        &g_generator_extra_exhaustion_observed,
-        saved_exhausted);
-    InterlockedExchange(
-        &g_generator_fallback_calls, saved_calls);
-    g_report = saved_report;
-    return result;
-}
-
-DWORD __cdecl
-GTAIVEFLCProceduralFixes_RunGeneratorPatchFixture(void)
-{
-    const DWORD fake_image_size = 0x0080B000u;
-    const DWORD test_capacity = 32768u;
-    struct PatchReport saved_report = g_report;
-    const struct BuildProfile *saved_profile = g_build_profile;
-    BYTE *fake_image = NULL;
-    struct GeneratorPatch patches[GENERATOR_PATCH_COUNT];
-    DWORD profile_index;
-    DWORD index;
-    DWORD span;
-    DWORD old_protection = 0u;
-    DWORD unused_protection = 0u;
-    DWORD decoded_target;
-    DWORD result = 0u;
-    BYTE *span_start;
-    BYTE *span_end;
-    MEMORY_BASIC_INFORMATION page_info;
-    LONG saved_transaction_dirty = InterlockedCompareExchange(
-        &g_generator_patch_transaction_dirty, 0, 0);
-#ifdef GTAIVPOOL_TEST_NO_FATAL
-    LONG saved_restore_failures = InterlockedCompareExchange(
-        &g_fixture_patch_protection_restore_failures, 0, 0);
-#endif
-
-    fake_image = (BYTE *)VirtualAlloc(
-        NULL, fake_image_size,
-        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    if (!fake_image) {
-        goto cleanup;
-    }
-    for (profile_index = 0u;
-         profile_index < g_build_profile_count;
-         ++profile_index) {
-        DWORD render_capacity_offset;
-        g_build_profile = &g_build_profiles[profile_index];
-        ZeroMemory(&g_report, sizeof(g_report));
-        configure_generator_patches(
-            fake_image, test_capacity, patches);
-        for (index = 0u;
-             index < GENERATOR_PATCH_COUNT;
-             ++index) {
-            copy_bytes(
-                patches[index].address,
-                patches[index].original,
-                patches[index].length);
-        }
-        if (!validate_generator_patches(patches) ||
-            !apply_generator_patches(patches)) {
-            goto cleanup;
-        }
-        for (index = 0u;
-             index < GENERATOR_PATCH_COUNT;
-             ++index) {
-            if (!bytes_are_equal(
-                    patches[index].address,
-                    patches[index].replacement,
-                    patches[index].length)) {
-                goto cleanup;
-            }
-        }
-        render_capacity_offset =
-            g_build_profile->code_variant == BUILD_CODE_CE ? 2u : 6u;
-        if (read_u32(patches[0].address + 6u) !=
-                test_capacity ||
-            read_u32(
-                patches[1].address +
-                render_capacity_offset) != test_capacity ||
-            patches[2].address[0] != 0xE9u ||
-            read_u32(patches[3].address + 1u) !=
-                test_capacity * GENERATOR_STAGING_RECORD_SIZE ||
-            read_u32(patches[4].address + 1u) !=
-                test_capacity) {
-            goto cleanup;
-        }
-        decoded_target =
-            (DWORD)(patches[2].address + 5u) +
-            read_u32(patches[2].address + 1u);
-        if (decoded_target !=
-            (DWORD)generator_pop_trampoline) {
-            goto cleanup;
-        }
-
-        span_start = patches[0].address;
-        span_end = patches[0].address + patches[0].length;
-        for (index = 1u; index < GENERATOR_PATCH_COUNT; ++index) {
-            BYTE *patch_end =
-                patches[index].address + patches[index].length;
-            if (patches[index].address < span_start) {
-                span_start = patches[index].address;
-            }
-            if (patch_end > span_end) {
-                span_end = patch_end;
-            }
-        }
-        span = (DWORD)(span_end - span_start);
-        old_protection = 0u;
-        unused_protection = 0u;
-        if (!VirtualProtect(
-                span_start, span,
-                PAGE_EXECUTE_READWRITE,
-                &old_protection)) {
-            goto cleanup;
-        }
-        if (!restore_generator_patches_writable(patches) ||
-            !FlushInstructionCache(
-                GetCurrentProcess(),
-                span_start, span) ||
-            !VirtualProtect(
-                span_start, span,
-                old_protection,
-                &unused_protection)) {
-            goto cleanup;
-        }
-        for (index = 0u; index < GENERATOR_PATCH_COUNT; ++index) {
-            if (!bytes_are_equal(
-                    patches[index].address,
-                    patches[index].original,
-                    patches[index].length)) {
-                goto cleanup;
-            }
-        }
-
-        /*
-         * Exercise the dirty-transaction path with a deliberately partial
-         * write.  Rollback must restore every site, flush the span, clear the
-         * dirty/applied state, and return the page to its prior protection.
-         */
-        ZeroMemory(&g_report, sizeof(g_report));
-        old_protection = 0u;
-        if (!VirtualProtect(
-                span_start, span, PAGE_EXECUTE_READWRITE,
-                &old_protection)) {
-            goto cleanup;
-        }
-        g_report.generator_old_protection = old_protection;
-        g_report.generator_patch_sites_applied =
-            GENERATOR_PATCH_COUNT;
-        InterlockedExchange(
-            &g_generator_patch_transaction_dirty, 1);
-        patches[0].address[0] = patches[0].replacement[0];
-        if (!rollback_generator_patch_transaction_writable(
-                patches, span_start, span, old_protection) ||
-            g_report.generator_patch_sites_applied != 0u ||
-            InterlockedCompareExchange(
-                &g_generator_patch_transaction_dirty, 0, 0) != 0 ||
-            VirtualQuery(
-                span_start, &page_info, sizeof(page_info)) !=
-                    sizeof(page_info) ||
-            page_info.Protect != old_protection) {
-            goto cleanup;
-        }
-        for (index = 0u; index < GENERATOR_PATCH_COUNT; ++index) {
-            if (!bytes_are_equal(
-                    patches[index].address,
-                    patches[index].original,
-                    patches[index].length)) {
-                goto cleanup;
-            }
-        }
-
-#ifdef GTAIVPOOL_TEST_NO_FATAL
-        /*
-         * Fail the first post-write protection restore.  apply must roll all
-         * bytes back and make a second, successful protection restore before
-         * reporting the original failure.
-         */
-        ZeroMemory(&g_report, sizeof(g_report));
-        InterlockedExchange(
-            &g_fixture_patch_protection_restore_failures, 1);
-        if (apply_generator_patches(patches) ||
-            g_report.status !=
-                STATUS_GENERATOR_PROTECTION_RESTORE_FAILED ||
-            g_report.generator_patch_sites_applied != 0u ||
-            InterlockedCompareExchange(
-                &g_generator_patch_transaction_dirty, 0, 0) != 0 ||
-            InterlockedCompareExchange(
-                &g_fixture_patch_protection_restore_failures,
-                0, 0) != 0 ||
-            VirtualQuery(
-                span_start, &page_info, sizeof(page_info)) !=
-                    sizeof(page_info) ||
-            page_info.Protect != old_protection) {
-            goto cleanup;
-        }
-        for (index = 0u; index < GENERATOR_PATCH_COUNT; ++index) {
-            if (!bytes_are_equal(
-                    patches[index].address,
-                    patches[index].original,
-                    patches[index].length)) {
-                goto cleanup;
-            }
-        }
-#endif
-    }
-    result = 1u;
-
-cleanup:
-    if (fake_image) {
-        VirtualFree(fake_image, 0, MEM_RELEASE);
-    }
-    g_build_profile = saved_profile;
-    g_report = saved_report;
-    InterlockedExchange(
-        &g_generator_patch_transaction_dirty,
-        saved_transaction_dirty);
-#ifdef GTAIVPOOL_TEST_NO_FATAL
-    InterlockedExchange(
-        &g_fixture_patch_protection_restore_failures,
-        saved_restore_failures);
-#endif
-    return result;
-}
-
-DWORD __cdecl
-GTAIVEFLCProceduralFixes_RunTelemetryFixture(void)
-{
-    struct TelemetrySnapshot snapshot;
-    poll_exhaustion_once();
-    if (!capture_telemetry_snapshot(&snapshot)) {
-        return 0;
-    }
-    write_telemetry_sample(
-        &snapshot, 1u,
-        snapshot.surface_active, snapshot.source_active);
-    return snapshot.invariant_valid ? 1u : 2u;
-}
-
-DWORD __cdecl
-GTAIVEFLCProceduralFixes_RunProviderRelocationFixture(void)
-{
-    const DWORD fake_image_size = 0x00888000u;
-    const DWORD test_capacity = 1024u;
-    struct PatchReport saved_report = g_report;
-    const struct BuildProfile *saved_profile = g_build_profile;
-    BYTE *saved_storage = g_provider_storage;
-    BYTE *saved_records = g_provider_records;
-    BYTE *saved_manager = g_manager;
-    BYTE *saved_rebuild_stub = g_provider_rebuild_stub;
-    DWORD saved_capacity = g_provider_capacity;
-    LONG saved_rebuilds = InterlockedCompareExchange(
-        &g_provider_rebuilds_verified, 0, 0);
-    LONG saved_rebuild_failures = InterlockedCompareExchange(
-        &g_provider_rebuild_failures, 0, 0);
-    BYTE *fake_image = NULL;
-    BYTE *test_storage = NULL;
-    struct ProviderPatch patches[PROVIDER_PATCH_CAPACITY];
-    DWORD profile_index;
-    DWORD index;
-    DWORD result = 0;
-    MEMORY_BASIC_INFORMATION page_info;
-    LONG saved_transaction_dirty = InterlockedCompareExchange(
-        &g_provider_patch_transaction_dirty, 0, 0);
-#ifdef GTAIVPOOL_TEST_NO_FATAL
-    LONG saved_restore_failures = InterlockedCompareExchange(
-        &g_fixture_patch_protection_restore_failures, 0, 0);
-#endif
-
-    fake_image = (BYTE *)VirtualAlloc(
-        NULL, fake_image_size,
-        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    if (!fake_image) {
-        goto cleanup;
-    }
-
-    g_provider_storage = NULL;
-    g_provider_records = NULL;
-    g_provider_rebuild_stub = NULL;
-    g_provider_capacity = VANILLA_PROVIDER_CAPACITY;
-    ZeroMemory(&g_report, sizeof(g_report));
-    if (!initialize_provider_storage(test_capacity)) {
-        goto cleanup;
-    }
-    test_storage = g_provider_storage;
-    if (!initialize_provider_rebuild_stub()) {
-        goto cleanup;
-    }
-
-    if (read_u16(g_provider_records + SOURCE_NEXT_OFFSET) != 2u ||
-        read_u16(g_provider_records + SOURCE_NEXT_OFFSET + 2u) != 0u ||
-        read_u16(
-            g_provider_records +
-            (test_capacity - 1u) * PROCEDURAL_RECORD_SIZE +
-            SOURCE_NEXT_OFFSET) != 0u ||
-        read_u16(
-            g_provider_records +
-            (test_capacity - 1u) * PROCEDURAL_RECORD_SIZE +
-            SOURCE_NEXT_OFFSET + 2u) !=
-            (WORD)(test_capacity - 1u)) {
-        goto cleanup;
-    }
-
-    g_manager = fake_image;
-    InterlockedExchange(&g_provider_rebuilds_verified, 0);
-    InterlockedExchange(&g_provider_rebuild_failures, 0);
-    write_u32(g_manager, 0u);
-    for (index = 0u; index < test_capacity; ++index) {
-        BYTE *record = g_provider_records +
-            index * PROCEDURAL_RECORD_SIZE;
-        write_u16(record + SOURCE_NEXT_OFFSET, 0xFFFFu);
-        write_u16(record + SOURCE_NEXT_OFFSET + 2u, 0xFFFFu);
-    }
-    provider_post_rebuild_hook(g_manager, 0u);
-    if (read_u32(g_manager) != 1u ||
-        InterlockedCompareExchange(
-            &g_provider_rebuilds_verified, 0, 0) != 1 ||
-        InterlockedCompareExchange(
-            &g_provider_rebuild_failures, 0, 0) != 0 ||
-        read_u16(g_provider_records + SOURCE_NEXT_OFFSET) != 2u ||
-        read_u16(
-            g_provider_records +
-            (test_capacity - 1u) * PROCEDURAL_RECORD_SIZE +
-            SOURCE_NEXT_OFFSET) != 0u) {
-        goto cleanup;
-    }
-    write_u32(
-        g_provider_records + PROVIDER_OWNER_POINTER_OFFSET, 1u);
-    provider_post_rebuild_hook(g_manager, 0u);
-    if (read_u32(g_manager) != 0u ||
-        InterlockedCompareExchange(
-            &g_provider_rebuild_failures, 0, 0) != 1) {
-        goto cleanup;
-    }
-    write_u32(
-        g_provider_records + PROVIDER_OWNER_POINTER_OFFSET, 0u);
-    provider_post_rebuild_hook(g_manager, 0u);
-    if (read_u32(g_manager) != 1u ||
-        InterlockedCompareExchange(
-            &g_provider_rebuilds_verified, 0, 0) != 2) {
-        goto cleanup;
-    }
-
-    for (profile_index = 0u;
-         profile_index < g_build_profile_count;
-         ++profile_index) {
-        BYTE *span_start;
-        BYTE *span_end;
-        DWORD span;
-        DWORD old_protection = 0u;
-        DWORD unused_protection = 0u;
-        DWORD record_index_base =
-            (DWORD)g_provider_records - PROCEDURAL_RECORD_SIZE;
-        DWORD next_index_base =
-            (DWORD)g_provider_records -
-            (PROCEDURAL_RECORD_SIZE - SOURCE_NEXT_OFFSET);
-
-        g_build_profile = &g_build_profiles[profile_index];
-        if (!g_build_profile->provider_supported ||
-            PROVIDER_PATCH_COUNT == 0u) {
-            goto cleanup;
-        }
-        ZeroMemory(&g_report, sizeof(g_report));
-        configure_provider_patches(fake_image, patches);
-        for (index = 0u; index < PROVIDER_PATCH_COUNT; ++index) {
-            copy_bytes(
-                patches[index].address,
-                patches[index].original,
-                patches[index].length);
-        }
-        if (!validate_provider_patches(patches) ||
-            !apply_provider_patches(patches)) {
-            goto cleanup;
-        }
-        for (index = 0u; index < PROVIDER_PATCH_COUNT; ++index) {
-            if (!bytes_are_equal(
-                    patches[index].address,
-                    patches[index].replacement,
-                    patches[index].length)) {
-                goto cleanup;
-            }
-        }
-        if (g_build_profile->provider_patch_variant ==
-                PROVIDER_PATCH_VARIANT_CE) {
-            if (PROVIDER_RELOCATION_PATCH_COUNT != 10u ||
-                PROVIDER_PATCH_COUNT != 12u ||
-                patches[9].replacement[0] != 0x6Bu ||
-                patches[9].replacement[1] != 0xC6u ||
-                patches[9].replacement[2] != 0x60u ||
-                patches[10].length != 6u ||
-                patches[10].replacement[2] != 0u ||
-                patches[11].length != 9u) {
-                goto cleanup;
-            }
-        } else if (
-            g_build_profile->provider_patch_variant ==
-                PROVIDER_PATCH_VARIANT_PATCH8) {
-            if (PROVIDER_RELOCATION_PATCH_COUNT != 9u ||
-                PROVIDER_PATCH_COUNT != 11u ||
-                patches[0].replacement[0] != 0x6Bu ||
-                patches[0].replacement[1] != 0xC0u ||
-                patches[0].replacement[2] != 0x60u ||
-                read_u32(patches[0].replacement + 4u) !=
-                    record_index_base ||
-                patches[1].replacement[0] != 0xB9u ||
-                read_u32(patches[1].replacement + 1u) !=
-                    (DWORD)g_provider_storage ||
-                read_u32(patches[3].replacement) !=
-                    next_index_base ||
-                read_u32(patches[4].replacement) !=
-                    record_index_base ||
-                patches[6].replacement[3] != 0x6Bu ||
-                patches[6].replacement[4] != 0xC0u ||
-                patches[6].replacement[5] != 0x60u ||
-                patches[7].replacement[0] != 0x6Bu ||
-                patches[7].replacement[1] != 0xC7u ||
-                patches[7].replacement[2] != 0x60u ||
-                patches[8].replacement[0] != 0x6Bu ||
-                patches[8].replacement[1] != 0xC0u ||
-                patches[8].replacement[2] != 0x60u ||
-                patches[9].length != 5u ||
-                patches[9].replacement[3] != 0u ||
-                patches[10].length != 9u) {
-                goto cleanup;
-            }
-        } else {
-            goto cleanup;
-        }
-        if (patches[PROVIDER_RELOCATION_PATCH_COUNT].address !=
-                fake_image + PROVIDER_HEAD_QUARANTINE_RVA ||
-            patches[PROVIDER_RELOCATION_PATCH_COUNT + 1u].address !=
-                fake_image + PROVIDER_REBUILD_EPILOGUE_RVA ||
-            patches[PROVIDER_RELOCATION_PATCH_COUNT + 1u]
-                    .replacement[0] != 0xE9u ||
-            (DWORD)(patches[PROVIDER_RELOCATION_PATCH_COUNT + 1u]
-                    .address + 5u) +
-                read_u32(
-                    patches[PROVIDER_RELOCATION_PATCH_COUNT + 1u]
-                        .replacement + 1u) !=
-                (DWORD)g_provider_rebuild_stub) {
-            goto cleanup;
-        }
-        for (index = 5u; index < 9u; ++index) {
-            if (patches[PROVIDER_RELOCATION_PATCH_COUNT + 1u]
-                    .replacement[index] != 0x90u) {
-                goto cleanup;
-            }
-        }
-
-        span_start = patches[0].address;
-        span_end = patches[0].address + patches[0].length;
-        for (index = 1u; index < PROVIDER_PATCH_COUNT; ++index) {
-            BYTE *patch_end =
-                patches[index].address + patches[index].length;
-            if (patches[index].address < span_start) {
-                span_start = patches[index].address;
-            }
-            if (patch_end > span_end) {
-                span_end = patch_end;
-            }
-        }
-        span = (DWORD)(span_end - span_start);
-        if (!VirtualProtect(
-                span_start, span, PAGE_EXECUTE_READWRITE,
-                &old_protection) ||
-            !restore_provider_patches_writable(patches) ||
-            !FlushInstructionCache(
-                GetCurrentProcess(), span_start, span) ||
-            !VirtualProtect(
-                span_start, span, old_protection,
-                &unused_protection)) {
-            goto cleanup;
-        }
-        for (index = 0u; index < PROVIDER_PATCH_COUNT; ++index) {
-            if (!bytes_are_equal(
-                    patches[index].address,
-                    patches[index].original,
-                    patches[index].length)) {
-                goto cleanup;
-            }
-        }
-
-        /* Verify recovery from a transaction that wrote only one site. */
-        ZeroMemory(&g_report, sizeof(g_report));
-        old_protection = 0u;
-        unused_protection = 0u;
-        if (!VirtualProtect(
-                span_start, span, PAGE_EXECUTE_READWRITE,
-                &old_protection)) {
-            goto cleanup;
-        }
-        g_report.provider_old_protection = old_protection;
-        g_report.provider_patch_sites_applied = PROVIDER_PATCH_COUNT;
-        InterlockedExchange(&g_provider_patch_transaction_dirty, 1);
-        copy_bytes(
-            patches[0].address,
-            patches[0].replacement,
-            patches[0].length);
-        if (!rollback_provider_patch_transaction_writable(
-                patches, span_start, span, old_protection) ||
-            g_report.provider_patch_sites_applied != 0u ||
-            InterlockedCompareExchange(
-                &g_provider_patch_transaction_dirty, 0, 0) != 0 ||
-            VirtualQuery(
-                span_start, &page_info, sizeof(page_info)) !=
-                    sizeof(page_info) ||
-            page_info.Protect != old_protection) {
-            goto cleanup;
-        }
-        for (index = 0u; index < PROVIDER_PATCH_COUNT; ++index) {
-            if (!bytes_are_equal(
-                    patches[index].address,
-                    patches[index].original,
-                    patches[index].length)) {
-                goto cleanup;
-            }
-        }
-
-#ifdef GTAIVPOOL_TEST_NO_FATAL
-        /* Verify fail-closed recovery after the first restore call fails. */
-        ZeroMemory(&g_report, sizeof(g_report));
-        InterlockedExchange(
-            &g_fixture_patch_protection_restore_failures, 1);
-        if (apply_provider_patches(patches) ||
-            g_report.status !=
-                STATUS_PROVIDER_PROTECTION_RESTORE_FAILED ||
-            g_report.provider_patch_sites_applied != 0u ||
-            InterlockedCompareExchange(
-                &g_provider_patch_transaction_dirty, 0, 0) != 0 ||
-            InterlockedCompareExchange(
-                &g_fixture_patch_protection_restore_failures,
-                0, 0) != 0 ||
-            VirtualQuery(
-                span_start, &page_info, sizeof(page_info)) !=
-                    sizeof(page_info) ||
-            page_info.Protect != old_protection) {
-            goto cleanup;
-        }
-        for (index = 0u; index < PROVIDER_PATCH_COUNT; ++index) {
-            if (!bytes_are_equal(
-                    patches[index].address,
-                    patches[index].original,
-                    patches[index].length)) {
-                goto cleanup;
-            }
-        }
-#endif
-    }
-    result = 1;
-
-cleanup:
-    if (test_storage) {
-        VirtualFree(test_storage, 0, MEM_RELEASE);
-    }
-    release_provider_rebuild_stub();
-    if (fake_image) {
-        VirtualFree(fake_image, 0, MEM_RELEASE);
-    }
-    g_provider_storage = saved_storage;
-    g_provider_records = saved_records;
-    g_provider_rebuild_stub = saved_rebuild_stub;
-    g_provider_capacity = saved_capacity;
-    g_manager = saved_manager;
-    InterlockedExchange(
-        &g_provider_rebuilds_verified, saved_rebuilds);
-    InterlockedExchange(
-        &g_provider_rebuild_failures, saved_rebuild_failures);
-    g_build_profile = saved_profile;
-    g_report = saved_report;
-    InterlockedExchange(
-        &g_provider_patch_transaction_dirty,
-        saved_transaction_dirty);
-#ifdef GTAIVPOOL_TEST_NO_FATAL
-    InterlockedExchange(
-        &g_fixture_patch_protection_restore_failures,
-        saved_restore_failures);
-#endif
-    return result;
-}
-
-DWORD __cdecl
-GTAIVEFLCProceduralFixes_RunProviderMismatchFixture(void)
-{
-    const DWORD fake_image_size = 0x00888000u;
-    struct PatchReport saved_report = g_report;
-    const struct BuildProfile *saved_profile = g_build_profile;
-    BYTE *saved_storage = g_provider_storage;
-    BYTE *saved_records = g_provider_records;
-    BYTE *saved_rebuild_stub = g_provider_rebuild_stub;
-    DWORD saved_capacity = g_provider_capacity;
-    BYTE *fake_image = NULL;
-    BYTE *test_storage = NULL;
-    struct ProviderPatch patches[PROVIDER_PATCH_CAPACITY];
-    DWORD profile_index;
-    DWORD index;
-    DWORD result = 0;
-
-    fake_image = (BYTE *)VirtualAlloc(
-        NULL, fake_image_size,
-        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    if (!fake_image) {
-        goto cleanup;
-    }
-
-    g_provider_storage = NULL;
-    g_provider_records = NULL;
-    g_provider_rebuild_stub = NULL;
-    g_provider_capacity = VANILLA_PROVIDER_CAPACITY;
-    ZeroMemory(&g_report, sizeof(g_report));
-    if (!initialize_provider_storage(1024u)) {
-        goto cleanup;
-    }
-    test_storage = g_provider_storage;
-    if (!initialize_provider_rebuild_stub()) {
-        goto cleanup;
-    }
-
-    for (profile_index = 0u;
-         profile_index < g_build_profile_count;
-         ++profile_index) {
-        g_build_profile = &g_build_profiles[profile_index];
-        if (!g_build_profile->provider_supported ||
-            PROVIDER_PATCH_COUNT == 0u) {
-            goto cleanup;
-        }
-        ZeroMemory(&g_report, sizeof(g_report));
-        configure_provider_patches(fake_image, patches);
-        for (index = 0u; index < PROVIDER_PATCH_COUNT; ++index) {
-            copy_bytes(
-                patches[index].address,
-                patches[index].original,
-                patches[index].length);
-        }
-
-        patches[0].address[0] ^= 0x01u;
-        if (validate_provider_patches(patches) ||
-            g_report.provider_patch_sites_verified !=
-                PROVIDER_PATCH_COUNT - 1u ||
-            g_report.provider_patch_site_mismatches != 1u ||
-            g_report.provider_first_mismatch_site != 1u ||
-            g_report.provider_first_mismatch_byte != 0u ||
-            patches[0].original_match != 0u ||
-            patches[0].observed_at_validation[0] !=
-                (BYTE)(patches[0].original[0] ^ 0x01u)) {
-            goto cleanup;
-        }
-    }
-    result = 1u;
-
-cleanup:
-    if (test_storage) {
-        VirtualFree(test_storage, 0, MEM_RELEASE);
-    }
-    release_provider_rebuild_stub();
-    if (fake_image) {
-        VirtualFree(fake_image, 0, MEM_RELEASE);
-    }
-    g_provider_storage = saved_storage;
-    g_provider_records = saved_records;
-    g_provider_rebuild_stub = saved_rebuild_stub;
-    g_provider_capacity = saved_capacity;
-    g_build_profile = saved_profile;
-    g_report = saved_report;
-    return result;
-}
-
-DWORD __cdecl
-GTAIVEFLCProceduralFixes_RunDefinitionScalingFixture(void)
-{
-    struct PatchReport saved_report = g_report;
-    BYTE *saved_manager = g_definition_manager;
-    DWORD saved_plant_multiplier =
-        g_plant_density_multiplier;
-    float saved_proc_multiplier =
-        g_procobj_density_multiplier;
-    DWORD saved_density_mask = g_density_class_mask;
-    static const BYTE classes[4] = {
-        DENSITY_CLASS_GRASS,
-        DENSITY_CLASS_VEGETATION,
-        DENSITY_CLASS_CLUTTER,
-        DENSITY_CLASS_OTHER
-    };
-    BYTE *fake_manager = NULL;
-    BYTE *proc0;
-    BYTE *proc1;
-    BYTE *proc2;
-    BYTE *proc3;
-    BYTE *plant0;
-    BYTE *plant1;
-    float expected_grid_spacing;
-    float expected_grid_inverse;
-    DWORD result = 0;
-
-    fake_manager = (BYTE *)VirtualAlloc(
-        NULL, DEFINITION_MANAGER_REQUIRED_SIZE,
-        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    if (!fake_manager) {
-        goto cleanup;
-    }
-    ZeroMemory(
-        fake_manager,
-        DEFINITION_MANAGER_REQUIRED_SIZE);
-    write_u32(
-        fake_manager +
-        DEFINITION_PROCOBJ_COUNT_OFFSET, 4u);
-    write_u32(
-        fake_manager +
-        DEFINITION_PLANT_COUNT_OFFSET, 2u);
-
-    proc0 = fake_manager +
-        DEFINITION_PROCOBJ_RECORDS_OFFSET;
-    proc1 = proc0 +
-        DEFINITION_PROCOBJ_RECORD_SIZE;
-    proc2 = proc1 +
-        DEFINITION_PROCOBJ_RECORD_SIZE;
-    proc3 = proc2 +
-        DEFINITION_PROCOBJ_RECORD_SIZE;
-    plant0 = fake_manager +
-        DEFINITION_PLANT_RECORDS_OFFSET;
-    plant1 = plant0 +
-        DEFINITION_PLANT_RECORD_SIZE;
-
-    write_float(
-        proc0 + DEFINITION_PROCOBJ_SPACING_OFFSET,
-        10.0f);
-    write_float(
-        proc0 +
-        DEFINITION_PROCOBJ_INVERSE_SQUARE_OFFSET,
-        0.01f);
-    write_float(
-        proc1 + DEFINITION_PROCOBJ_SPACING_OFFSET,
-        8.0f);
-    write_float(
-        proc1 +
-        DEFINITION_PROCOBJ_INVERSE_SQUARE_OFFSET,
-        0.015625f);
-    proc1[DEFINITION_PROCOBJ_USEGRID_OFFSET] = 1u;
-    write_float(
-        proc2 + DEFINITION_PROCOBJ_SPACING_OFFSET,
-        6.0f);
-    write_float(
-        proc2 + DEFINITION_PROCOBJ_INVERSE_SQUARE_OFFSET,
-        1.0f / 36.0f);
-    write_float(
-        proc3 + DEFINITION_PROCOBJ_SPACING_OFFSET,
-        4.0f);
-    write_float(
-        proc3 + DEFINITION_PROCOBJ_INVERSE_SQUARE_OFFSET,
-        0.0625f);
-    proc3[DEFINITION_PROCOBJ_USEGRID_OFFSET] = 1u;
-    write_float(
-        plant0 + DEFINITION_PLANT_DENSITY_OFFSET,
-        0.4f);
-    write_float(
-        plant1 + DEFINITION_PLANT_DENSITY_OFFSET,
-        0.8f);
-
-    ZeroMemory(&g_report, sizeof(g_report));
-    g_definition_manager = fake_manager;
-    g_plant_density_multiplier = 3u;
-    g_procobj_density_multiplier = 1.5f;
-    g_density_class_mask =
-        DENSITY_CLASS_MASK_GRASS |
-        DENSITY_CLASS_MASK_VEGETATION;
-    g_report.plant_density_multiplier = 3u;
-    g_report.procobj_density_multiplier_bits =
-        read_u32((BYTE *)&g_procobj_density_multiplier);
-    g_report.density_class_mask = g_density_class_mask;
-    reset_definition_scaling_tracking();
-    g_report.procobj_definition_count = 4u;
-    g_report.plant_definition_count = 2u;
-    if (!scale_loaded_definitions_for_catalog(
-            4u, 2u, classes)) {
-        goto cleanup;
-    }
-
-    expected_grid_spacing =
-        8.0f / positive_square_root(1.5f);
-    expected_grid_inverse = 0.015625f * 1.5f;
-    if (g_report.definition_scaling_status !=
-            DEFINITION_SCALING_APPLIED ||
-        g_report.procobj_definitions_scaled != 2u ||
-        g_report.procobj_definitions_selected != 2u ||
-        g_report.procobj_random_definitions_scaled != 1u ||
-        g_report.procobj_grid_definitions_scaled != 1u ||
-        g_report.procobj_definitions_unselected != 2u ||
-        g_report.plant_definitions_scaled != 0u ||
-        read_u32(
-            proc0 + DEFINITION_PROCOBJ_SPACING_OFFSET) !=
-            0x41200000u ||
-        read_u32(
-            proc0 +
-            DEFINITION_PROCOBJ_INVERSE_SQUARE_OFFSET) !=
-            read_u32((BYTE *)&(float){0.015f}) ||
-        read_u32(
-            proc1 + DEFINITION_PROCOBJ_SPACING_OFFSET) !=
-            read_u32((BYTE *)&expected_grid_spacing) ||
-        read_u32(
-            proc1 +
-            DEFINITION_PROCOBJ_INVERSE_SQUARE_OFFSET) !=
-            read_u32((BYTE *)&expected_grid_inverse) ||
-        read_u32(
-            proc2 + DEFINITION_PROCOBJ_SPACING_OFFSET) !=
-            read_u32((BYTE *)&(float){6.0f}) ||
-        read_u32(
-            proc2 + DEFINITION_PROCOBJ_INVERSE_SQUARE_OFFSET) !=
-            read_u32((BYTE *)&(float){1.0f / 36.0f}) ||
-        read_u32(
-            proc3 + DEFINITION_PROCOBJ_SPACING_OFFSET) !=
-            read_u32((BYTE *)&(float){4.0f}) ||
-        read_u32(
-            proc3 + DEFINITION_PROCOBJ_INVERSE_SQUARE_OFFSET) !=
-            read_u32((BYTE *)&(float){0.0625f}) ||
-        read_u32(
-            plant0 + DEFINITION_PLANT_DENSITY_OFFSET) !=
-            read_u32((BYTE *)&(float){0.4f}) ||
-        read_u32(
-            plant1 + DEFINITION_PLANT_DENSITY_OFFSET) !=
-            read_u32((BYTE *)&(float){0.8f})) {
-        goto cleanup;
-    }
-    verify_definition_scaling_live();
-    if (g_report.definition_live_fields_verified != 3u ||
-        g_report.definition_live_mismatches != 0u ||
-        g_report.plant_live_fields_observed != 2u ||
-        g_report.plant_live_observation_mismatches != 0u ||
-        !restore_loaded_definitions_to_original() ||
-        g_report.definition_scaling_status !=
-            DEFINITION_SCALING_ROLLED_BACK_SAFETY ||
-        read_u32(
-            proc0 + DEFINITION_PROCOBJ_INVERSE_SQUARE_OFFSET) !=
-            read_u32((BYTE *)&(float){0.01f}) ||
-        read_u32(
-            proc1 + DEFINITION_PROCOBJ_SPACING_OFFSET) !=
-            read_u32((BYTE *)&(float){8.0f}) ||
-        read_u32(
-            proc1 + DEFINITION_PROCOBJ_INVERSE_SQUARE_OFFSET) !=
-            read_u32((BYTE *)&(float){0.015625f}) ||
-        read_u32(
-            plant0 + DEFINITION_PLANT_DENSITY_OFFSET) !=
-            read_u32((BYTE *)&(float){0.4f}) ||
-        read_u32(
-            plant1 + DEFINITION_PLANT_DENSITY_OFFSET) !=
-            read_u32((BYTE *)&(float){0.8f})) {
-        goto cleanup;
-    }
-
-    ZeroMemory(&g_report, sizeof(g_report));
-    g_procobj_density_multiplier = 1.0f;
-    reset_definition_scaling_tracking();
-    g_report.procobj_definition_count = 4u;
-    g_report.plant_definition_count = 2u;
-    if (!scale_loaded_definitions_for_catalog(
-            4u, 2u, classes) ||
-        g_report.definition_scaling_status !=
-            DEFINITION_SCALING_NO_CHANGE ||
-        g_report.procobj_definitions_selected != 2u ||
-        g_report.procobj_definitions_scaled != 0u) {
-        goto cleanup;
-    }
-
-    ZeroMemory(&g_report, sizeof(g_report));
-    g_procobj_density_multiplier = 2.0f;
-    reset_definition_scaling_tracking();
-    g_report.procobj_definition_count = 4u;
-    g_report.plant_definition_count = 2u;
-    if (!scale_loaded_definitions_for_catalog(
-            4u, 2u, classes) ||
-        g_report.definition_scaling_status !=
-            DEFINITION_SCALING_APPLIED ||
-        read_u32(
-            proc0 + DEFINITION_PROCOBJ_INVERSE_SQUARE_OFFSET) !=
-            read_u32((BYTE *)&(float){0.02f}) ||
-        !restore_loaded_definitions_to_original()) {
-        goto cleanup;
-    }
-
-    ZeroMemory(&g_report, sizeof(g_report));
-    g_procobj_density_multiplier = 0.1f;
-    reset_definition_scaling_tracking();
-    g_report.procobj_definition_count = 4u;
-    g_report.plant_definition_count = 2u;
-    if (!scale_loaded_definitions_for_catalog(
-            4u, 2u, classes) ||
-        g_report.definition_scaling_status !=
-            DEFINITION_SCALING_APPLIED ||
-        read_u32(
-            proc0 + DEFINITION_PROCOBJ_SPACING_OFFSET) !=
-            read_u32((BYTE *)&(float){10.0f}) ||
-        read_u32(
-            proc0 + DEFINITION_PROCOBJ_INVERSE_SQUARE_OFFSET) !=
-            read_u32((BYTE *)&(float){0.001f}) ||
-        read_u32(
-            proc1 + DEFINITION_PROCOBJ_SPACING_OFFSET) !=
-            read_u32((BYTE *)&(float){
-                8.0f / positive_square_root(0.1f)}) ||
-        read_u32(
-            proc1 + DEFINITION_PROCOBJ_INVERSE_SQUARE_OFFSET) !=
-            read_u32((BYTE *)&(float){0.0015625f}) ||
-        !restore_loaded_definitions_to_original()) {
-        goto cleanup;
-    }
-
-    write_u32(
-        proc0 + DEFINITION_PROCOBJ_INVERSE_SQUARE_OFFSET,
-        0x7FC00000u);
-    ZeroMemory(&g_report, sizeof(g_report));
-    g_procobj_density_multiplier = 1.5f;
-    reset_definition_scaling_tracking();
-    g_report.procobj_definition_count = 4u;
-    g_report.plant_definition_count = 2u;
-    if (scale_loaded_definitions_for_catalog(
-            4u, 2u, classes) ||
-        g_report.definition_scaling_status !=
-            DEFINITION_SCALING_BAD_FLOAT ||
-        read_u32(
-            plant0 + DEFINITION_PLANT_DENSITY_OFFSET) !=
-            read_u32((BYTE *)&(float){0.4f})) {
-        goto cleanup;
-    }
-    result = 1;
-
-cleanup:
-    if (fake_manager) {
-        VirtualFree(fake_manager, 0, MEM_RELEASE);
-    }
-    g_definition_manager = saved_manager;
-    g_plant_density_multiplier =
-        saved_plant_multiplier;
-    g_procobj_density_multiplier =
-        saved_proc_multiplier;
-    g_density_class_mask = saved_density_mask;
-    g_report = saved_report;
-    return result;
-}
-
-static DWORD WINAPI definition_activation_race_fixture_thread(
-    LPVOID parameter)
-{
-    (void)parameter;
-    definition_loaded_engine_callback();
-    return 0u;
-}
-
-DWORD __cdecl
-GTAIVEFLCProceduralFixes_RunDefinitionActivationRaceFixture(void)
-{
-    struct PatchReport saved_report = g_report;
-    BYTE *saved_manager = g_definition_manager;
-    LONG saved_state = InterlockedCompareExchange(
-        &g_definition_callback_state, 0, 0);
-    LONG saved_calls = InterlockedCompareExchange(
-        &g_definition_callback_calls, 0, 0);
-    HANDLE thread = NULL;
-    DWORD index;
-    DWORD result = 0u;
-
-    ZeroMemory(&g_report, sizeof(g_report));
-    g_definition_manager = NULL;
-    InterlockedExchange(&g_definition_callback_state,
-                        DEFINITION_CALLBACK_UNARMED);
-    InterlockedExchange(&g_definition_callback_calls, 0);
-    InterlockedExchange(&g_definition_callback_test_pause_unarmed, 1);
-    InterlockedExchange(&g_definition_callback_test_unarmed_reached, 0);
-    InterlockedExchange(&g_definition_callback_test_unarmed_release, 0);
-    InterlockedExchange(&g_definition_callback_test_force_success, 1);
-    thread = CreateThread(
-        NULL, 0u, definition_activation_race_fixture_thread,
-        NULL, 0u, NULL);
-    if (!thread) {
-        goto cleanup;
-    }
-    for (index = 0u; index < 2000u; ++index) {
-        if (InterlockedCompareExchange(
-                &g_definition_callback_test_unarmed_reached,
-                0, 0) != 0) {
-            break;
-        }
-        Sleep(1u);
-    }
-    if (InterlockedCompareExchange(
-            &g_definition_callback_test_unarmed_reached, 0, 0) != 1 ||
-        InterlockedCompareExchange(
-            &g_definition_callback_state,
-            DEFINITION_CALLBACK_ARMED,
-            DEFINITION_CALLBACK_UNARMED) !=
-            DEFINITION_CALLBACK_UNARMED) {
-        goto cleanup;
-    }
-    InterlockedExchange(
-        &g_definition_callback_test_unarmed_release, 1);
-    if (WaitForSingleObject(thread, 2000u) != WAIT_OBJECT_0 ||
-        InterlockedCompareExchange(
-            &g_definition_callback_state, 0, 0) !=
-            DEFINITION_CALLBACK_COMPLETE ||
-        InterlockedCompareExchange(
-            &g_definition_callback_calls, 0, 0) != 1 ||
-        g_report.definition_callback_thread_id == 0u ||
-        g_report.definition_callback_state !=
-            DEFINITION_CALLBACK_COMPLETE ||
-        g_report.definition_scaling_status ==
-            DEFINITION_SCALING_CALLBACK_BEFORE_ACTIVATION) {
-        goto cleanup;
-    }
-    CloseHandle(thread);
-    thread = NULL;
-
-    /* If the early callback wins UNARMED->FAILED, activation must never
-     * revive that terminal state. */
-    ZeroMemory(&g_report, sizeof(g_report));
-    InterlockedExchange(&g_definition_callback_state,
-                        DEFINITION_CALLBACK_UNARMED);
-    InterlockedExchange(&g_definition_callback_calls, 0);
-    InterlockedExchange(&g_definition_callback_test_pause_unarmed, 0);
-    definition_loaded_engine_callback();
-    if (InterlockedCompareExchange(
-            &g_definition_callback_state, 0, 0) !=
-            DEFINITION_CALLBACK_FAILED ||
-        InterlockedCompareExchange(
-            &g_definition_callback_calls, 0, 0) != 1 ||
-        g_report.definition_callback_thread_id != 0u ||
-        g_report.definition_scaling_status !=
-            DEFINITION_SCALING_CALLBACK_BEFORE_ACTIVATION ||
-        InterlockedCompareExchange(
-            &g_definition_callback_state,
-            DEFINITION_CALLBACK_ARMED,
-            DEFINITION_CALLBACK_UNARMED) !=
-            DEFINITION_CALLBACK_FAILED) {
-        goto cleanup;
-    }
-    result = 1u;
-
-cleanup:
-    InterlockedExchange(
-        &g_definition_callback_test_unarmed_release, 1);
-    if (thread) {
-        if (WaitForSingleObject(thread, 2000u) != WAIT_OBJECT_0) {
-            ExitProcess(26u);
-        }
-        CloseHandle(thread);
-    }
-    InterlockedExchange(&g_definition_callback_test_pause_unarmed, 0);
-    InterlockedExchange(&g_definition_callback_test_unarmed_reached, 0);
-    InterlockedExchange(&g_definition_callback_test_unarmed_release, 0);
-    InterlockedExchange(&g_definition_callback_test_force_success, 0);
-    InterlockedExchange(&g_definition_callback_state, saved_state);
-    InterlockedExchange(&g_definition_callback_calls, saved_calls);
-    g_definition_manager = saved_manager;
-    g_report = saved_report;
-    return result;
-}
-
-DWORD __cdecl
-GTAIVEFLCProceduralFixes_RunDensityFingerprintFixture(void)
-{
-    BYTE *saved_manager = g_definition_manager;
-    BYTE *fake_manager = NULL;
-    BYTE *record0;
-    BYTE *record1;
-    BYTE temporary[DEFINITION_PROCOBJ_RECORD_SIZE];
-    DWORD original_fingerprint;
-    DWORD reordered_fingerprint;
-    DWORD modified_fingerprint;
-    DWORD result = 0u;
-
-    fake_manager = (BYTE *)VirtualAlloc(
-        NULL, DEFINITION_MANAGER_REQUIRED_SIZE,
-        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    if (!fake_manager) {
-        goto cleanup;
-    }
-    ZeroMemory(fake_manager, DEFINITION_MANAGER_REQUIRED_SIZE);
-    record0 = fake_manager + DEFINITION_PROCOBJ_RECORDS_OFFSET;
-    record1 = record0 + DEFINITION_PROCOBJ_RECORD_SIZE;
-    write_float(
-        record0 + DEFINITION_PROCOBJ_SPACING_OFFSET, 10.0f);
-    write_float(
-        record0 + DEFINITION_PROCOBJ_INVERSE_SQUARE_OFFSET,
-        0.01f);
-    write_float(
-        record0 +
-        DEFINITION_PROCOBJ_DISTANCE_GATE_SQUARED_OFFSET,
-        25.0f);
-    record0[DEFINITION_PROCOBJ_ALIGN_OFFSET] = 1u;
-    write_float(
-        record1 + DEFINITION_PROCOBJ_SPACING_OFFSET, 8.0f);
-    write_float(
-        record1 + DEFINITION_PROCOBJ_INVERSE_SQUARE_OFFSET,
-        0.015625f);
-    write_float(
-        record1 +
-        DEFINITION_PROCOBJ_DISTANCE_GATE_SQUARED_OFFSET,
-        36.0f);
-    record1[DEFINITION_PROCOBJ_USEGRID_OFFSET] = 1u;
-    g_definition_manager = fake_manager;
-    if (!calculate_procobj_catalog_fingerprint(
-            2u, &original_fingerprint)) {
-        goto cleanup;
-    }
-
-    copy_bytes(temporary, record0, sizeof(temporary));
-    copy_bytes(record0, record1, DEFINITION_PROCOBJ_RECORD_SIZE);
-    copy_bytes(record1, temporary, DEFINITION_PROCOBJ_RECORD_SIZE);
-    if (!calculate_procobj_catalog_fingerprint(
-            2u, &reordered_fingerprint) ||
-        reordered_fingerprint == original_fingerprint) {
-        goto cleanup;
-    }
-
-    copy_bytes(temporary, record0, sizeof(temporary));
-    copy_bytes(record0, record1, DEFINITION_PROCOBJ_RECORD_SIZE);
-    copy_bytes(record1, temporary, DEFINITION_PROCOBJ_RECORD_SIZE);
-    write_float(
-        record0 + DEFINITION_PROCOBJ_SPACING_OFFSET, 9.0f);
-    if (!calculate_procobj_catalog_fingerprint(
-            2u, &modified_fingerprint) ||
-        modified_fingerprint == original_fingerprint) {
-        goto cleanup;
-    }
-
-    write_u32(
-        record0 + DEFINITION_PROCOBJ_SPACING_OFFSET,
-        0x7FC00000u);
-    if (calculate_procobj_catalog_fingerprint(
-            2u, &modified_fingerprint)) {
-        goto cleanup;
-    }
-    result = 1u;
-
-cleanup:
-    if (fake_manager) {
-        VirtualFree(fake_manager, 0, MEM_RELEASE);
-    }
-    g_definition_manager = saved_manager;
-    return result;
-}
-
-DWORD __cdecl
-GTAIVEFLCProceduralFixes_RunDensityRebaseFixture(void)
-{
-    char saved_ini[MAX_PATH];
-    char temp_dir[MAX_PATH];
-    char temp_ini[MAX_PATH];
-    const char *keys[2] = {"PlantDensityMultiplier", "ProceduralObjectDensityMultiplier"};
-    const char *inputs[5] = {"0.2", "0.5", "1.0", "2.0", "4.0"};
-    const float expected[5] = {0.1f, 0.25f, 0.5f, 1.0f, 2.0f};
-    const char *invalid[7] = {"0.1", "4.1", "nan", "inf", "-1", "1junk", "1e3"};
-    struct PatchReport saved_report = g_report;
-    DWORD i, k, result = 0u;
-    float configured, effective;
-    float distance;
-    copy_string(saved_ini, sizeof(saved_ini), g_ini_path);
-    if (!GetTempPathA(sizeof(temp_dir), temp_dir) ||
-        !GetTempFileNameA(temp_dir, "g12", 0u, temp_ini)) return 0u;
-    copy_string(g_ini_path, sizeof(g_ini_path), temp_ini);
-    for (k = 0u; k < 2u; ++k) {
-        for (i = 0u; i < 5u; ++i) {
-            if (!WritePrivateProfileStringA("ProceduralPool", keys[k], inputs[i], temp_ini) ||
-                !read_ini_rebased_density(keys[k], &configured, &effective) ||
-                effective != expected[i] || configured != expected[i] * 2.0f) goto done;
-        }
-        for (i = 0u; i < 7u; ++i) {
-            if (!WritePrivateProfileStringA("ProceduralPool", keys[k], invalid[i], temp_ini) ||
-                read_ini_rebased_density(keys[k], &configured, &effective)) goto done;
-        }
-        if (!WritePrivateProfileStringA("ProceduralPool", keys[k], NULL, temp_ini) ||
-            !read_ini_rebased_density(keys[k], &configured, &effective) ||
-            configured != 1.0f || effective != 0.5f) goto done;
-    }
-    if (!WritePrivateProfileStringA("ProceduralPool", "DistanceMultiplier", "0.5", temp_ini) ||
-        !read_ini_float_strict_default("DistanceMultiplier", "1.0",
-            MIN_CORRECTED_DISTANCE_MULTIPLIER, MAX_CORRECTED_DISTANCE_MULTIPLIER, &distance) ||
-        distance != 0.5f) goto done;
-    if (!WritePrivateProfileStringA("ProceduralPool", "DistanceMultiplier", "1.0", temp_ini) ||
-        !read_ini_float_strict_default("DistanceMultiplier", "1.0",
-            MIN_CORRECTED_DISTANCE_MULTIPLIER, MAX_CORRECTED_DISTANCE_MULTIPLIER, &distance) ||
-        distance != 1.0f) goto done;
-    result = 1u;
-done:
-    DeleteFileA(temp_ini);
-    copy_string(g_ini_path, sizeof(g_ini_path), saved_ini);
-    g_report = saved_report;
-    return result;
-}
-
-DWORD __cdecl
-GTAIVEFLCProceduralFixes_RunPublicPresetScalingFixture(void)
-{
-    float parsed_01;
-    float parsed_1;
-    float parsed_15;
-    float parsed_2;
-    float parsed_3;
-    float parsed_4;
-    DWORD selection;
-    DWORD expected;
-    const BYTE *classes;
-
-    if (!GTAIVEFLCProceduralFixes_RunDensityFingerprintFixture()) {
-        return 0u;
-    }
-
-    if (!parse_decimal_float_strict("0.1", &parsed_01) ||
-        !parse_decimal_float_strict("1.0", &parsed_1) ||
-        !parse_decimal_float_strict("1.5", &parsed_15) ||
-        !parse_decimal_float_strict("2.0", &parsed_2) ||
-        !parse_decimal_float_strict("3.0", &parsed_3) ||
-        !parse_decimal_float_strict("4.0", &parsed_4) ||
-        read_u32((BYTE *)&parsed_01) != 0x3DCCCCCDu ||
-        read_u32((BYTE *)&parsed_1) != 0x3F800000u ||
-        read_u32((BYTE *)&parsed_15) != 0x3FC00000u ||
-        read_u32((BYTE *)&parsed_2) != 0x40000000u ||
-        read_u32((BYTE *)&parsed_3) != 0x40400000u ||
-        read_u32((BYTE *)&parsed_4) != 0x40800000u ||
-        parse_decimal_float_strict("1..5", &parsed_1) ||
-        parse_decimal_float_strict("nan", &parsed_1) ||
-        parse_decimal_float_strict("1.00000000", &parsed_1)) {
-        return 0u;
-    }
-
-    classes = select_stock_procobj_catalog(
-        STOCK_PROCOBJ_BASE_COUNT,
-        STOCK_PROCOBJ_BASE_FINGERPRINT,
-        &selection, &expected);
-    if (classes != g_stock_procobj_base_classes ||
-        selection != DENSITY_CATALOG_STOCK_BASE ||
-        expected != STOCK_PROCOBJ_BASE_FINGERPRINT) {
-        return 0u;
-    }
-    classes = select_stock_procobj_catalog(
-        STOCK_PROCOBJ_EXPANDED_COUNT,
-        STOCK_PROCOBJ_EXPANDED_FINGERPRINT,
-        &selection, &expected);
-    if (classes != g_stock_procobj_expanded_classes ||
-        selection != DENSITY_CATALOG_STOCK_EXPANDED ||
-        expected != STOCK_PROCOBJ_EXPANDED_FINGERPRINT) {
-        return 0u;
-    }
-    classes = select_stock_procobj_catalog(
-        STOCK_PROCOBJ_BASE_COUNT,
-        STOCK_PROCOBJ_BASE_FINGERPRINT ^ 1u,
-        &selection, &expected);
-    if (classes || selection != DENSITY_CATALOG_NONE ||
-        expected != STOCK_PROCOBJ_BASE_FINGERPRINT) {
-        return 0u;
-    }
-    classes = select_stock_procobj_catalog(
-        STOCK_PROCOBJ_EXPANDED_COUNT,
-        STOCK_PROCOBJ_EXPANDED_FINGERPRINT ^ 0x01000000u,
-        &selection, &expected);
-    if (classes || selection != DENSITY_CATALOG_NONE ||
-        expected != STOCK_PROCOBJ_EXPANDED_FINGERPRINT ||
-        sizeof(g_stock_procobj_base_classes) !=
-            STOCK_PROCOBJ_BASE_COUNT ||
-        sizeof(g_stock_procobj_expanded_classes) !=
-            STOCK_PROCOBJ_EXPANDED_COUNT ||
-        sizeof(g_stock_plant_classes) != STOCK_PLANT_COUNT) {
-        return 0u;
-    }
-    return 1u;
-}
-
-DWORD __cdecl
-GTAIVEFLCProceduralFixes_RunExperimentalEnvelopeFixture(void)
-{
-    DWORD surface;
-    DWORD rendered;
-    DWORD provider;
-    if (!resolve_automatic_pool_profile(
-            0.5f, 0.1f, 0.1f,
-            &surface, &rendered, &provider) ||
-        surface != 40960u || rendered != 32768u || provider != 40u ||
-        !resolve_automatic_pool_profile(
-            1.5f, 1.0f, 1.0f,
-            &surface, &rendered, &provider) ||
-        surface != 40960u || rendered != 32768u || provider != 40u ||
-        !resolve_automatic_pool_profile(
-            1.1f, 1.0f, 1.0f,
-            &surface, &rendered, &provider) ||
-        surface != 40960u || rendered != 32768u || provider != 40u ||
-        !resolve_automatic_pool_profile(
-            2.5f, 1.0f, 1.0f,
-            &surface, &rendered, &provider) ||
-        surface != 40960u || rendered != 32768u || provider != 40u ||
-        !resolve_automatic_pool_profile(
-            2.0f, 2.0f, 2.0f,
-            &surface, &rendered, &provider) ||
-        surface != 40960u || rendered != 32768u || provider != 40u ||
-        !resolve_automatic_pool_profile(
-            2.5f, 2.0f, 1.0f,
-            &surface, &rendered, &provider) ||
-        surface != 40960u || rendered != 32768u || provider != 40u ||
-        !resolve_automatic_pool_profile(
-            4.0f, 1.0f, 1.0f,
-            &surface, &rendered, &provider) ||
-        surface != 40960u || rendered != 32768u || provider != 40u) {
-        return 0u;
-    }
-    return !resolve_automatic_pool_profile(
-        4.01f, 1.0f, 1.0f,
-        &surface, &rendered, &provider);
-}
-
-DWORD __cdecl
-GTAIVEFLCProceduralFixes_RunStabilityIsolationFixture(void)
-{
-    if (DEFAULT_CAPACITY != 40960u ||
-        MAX_OPERATIONAL_CAPACITY != 40960u ||
-        MIN_RENDERED_OBJECT_CAPACITY !=
-            VANILLA_RENDERED_OBJECT_CAPACITY ||
-        DEFAULT_RENDERED_OBJECT_CAPACITY != 4096u ||
-        MAX_RENDERED_OBJECT_CAPACITY != 32768u ||
-        DEFAULT_PROVIDER_CAPACITY != 40u ||
-        MAX_PROVIDER_CAPACITY != 40u ||
-        DEFAULT_DISTANCE_MULTIPLIER != 1u ||
-        MAX_DISTANCE_MULTIPLIER != 50u ||
-        DEFAULT_CORRECTED_DISTANCE_MULTIPLIER != 1.0f ||
-        MIN_CORRECTED_DISTANCE_MULTIPLIER != 0.5f ||
-        MAX_CORRECTED_DISTANCE_MULTIPLIER != 4.0f ||
-        LEGACY_DISTANCE_OPERAND_PATCH_ENABLED != 0u ||
-        LEGACY_MODEL_GLOBAL_DRAW_DISTANCE_MUTATION_ENABLED != 0u ||
-        GENERATED_PROCOBJ_DISTANCE_LIFECYCLE_ENABLED != 1u ||
-        TUNING_GOVERNOR_OBSERVATION_ONLY != 1u ||
-        DEFAULT_PLANT_DENSITY_MULTIPLIER != 1u ||
-        MAX_PLANT_DENSITY_MULTIPLIER != 50u ||
-        DEFAULT_CORRECTED_PLANT_DENSITY_MULTIPLIER != 1.0f ||
-        MIN_CORRECTED_PLANT_DENSITY_MULTIPLIER != 0.1f ||
-        MAX_CORRECTED_PLANT_DENSITY_MULTIPLIER != 2.0f ||
-        DEFAULT_PROCOBJ_DENSITY_MULTIPLIER != 1.0f ||
-        MIN_PROCOBJ_DENSITY_MULTIPLIER != 0.1f ||
-        MAX_PROCOBJ_DENSITY_MULTIPLIER != 2.0f ||
-        DEFAULT_DENSITY_CLASS_MASK != 3u ||
-        MAX_DENSITY_CLASS_MASK != 15u ||
-        STOCK_PROCOBJ_BASE_COUNT != 179u ||
-        STOCK_PROCOBJ_EXPANDED_COUNT != 209u ||
-        STOCK_PLANT_COUNT != 11u ||
-        DEFAULT_HANG_MESSAGE_BOX != 0u ||
-        TUNING_GOVERNOR_SUSTAINED_POLLS != 5u) {
-        return 0u;
-    }
-    return 1u;
-}
-
-DWORD __cdecl
-GTAIVEFLCProceduralFixes_RunModelDistanceScalingFixture(void)
-{
-    struct PatchReport saved_report = g_report;
-    BYTE *saved_definition_manager = g_definition_manager;
-    BYTE *saved_runtime_manager = g_manager;
-    BYTE *fake_manager = NULL;
-    BYTE *fake_runtime_manager = NULL;
-    BYTE *fake_table = NULL;
-    BYTE *fake_model_a = NULL;
-    BYTE *fake_model_b = NULL;
-    DWORD result = 0u;
-
-    if (!LEGACY_MODEL_GLOBAL_DRAW_DISTANCE_MUTATION_ENABLED) {
-        return 1u;
-    }
-
-    fake_manager = (BYTE *)VirtualAlloc(
-        NULL, DEFINITION_MANAGER_REQUIRED_SIZE,
-        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    fake_runtime_manager = (BYTE *)VirtualAlloc(
-        NULL, MANAGER_MINIMUM_SIZE,
-        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    fake_table = (BYTE *)VirtualAlloc(
-        NULL, MODEL_INFO_TABLE_REQUIRED_SIZE,
-        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    fake_model_a = (BYTE *)VirtualAlloc(
-        NULL, MODEL_INFO_REQUIRED_SIZE,
-        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    fake_model_b = (BYTE *)VirtualAlloc(
-        NULL, MODEL_INFO_REQUIRED_SIZE,
-        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    if (!fake_manager || !fake_runtime_manager || !fake_table ||
-        !fake_model_a || !fake_model_b) {
-        goto cleanup;
-    }
-    ZeroMemory(fake_manager, DEFINITION_MANAGER_REQUIRED_SIZE);
-    ZeroMemory(fake_runtime_manager, MANAGER_MINIMUM_SIZE);
-    ZeroMemory(fake_table, MODEL_INFO_TABLE_REQUIRED_SIZE);
-    ZeroMemory(fake_model_a, MODEL_INFO_REQUIRED_SIZE);
-    ZeroMemory(fake_model_b, MODEL_INFO_REQUIRED_SIZE);
-    write_float(
-        fake_runtime_manager + MANAGER_QUERY_RADIUS_OFFSET,
-        115.0f);
-    write_u32(
-        fake_manager + DEFINITION_PROCOBJ_COUNT_OFFSET,
-        3u);
-    write_u32(
-        fake_manager + DEFINITION_PLANT_COUNT_OFFSET,
-        1u);
-    write_u32(
-        fake_manager + DEFINITION_PROCOBJ_RECORDS_OFFSET +
-            DEFINITION_PROCOBJ_MODEL_INDEX_OFFSET,
-        123u);
-    write_u32(
-        fake_manager + DEFINITION_PROCOBJ_RECORDS_OFFSET +
-            DEFINITION_PROCOBJ_RECORD_SIZE +
-            DEFINITION_PROCOBJ_MODEL_INDEX_OFFSET,
-        456u);
-    write_u32(
-        fake_manager + DEFINITION_PROCOBJ_RECORDS_OFFSET +
-            DEFINITION_PROCOBJ_RECORD_SIZE * 2u +
-            DEFINITION_PROCOBJ_MODEL_INDEX_OFFSET,
-        123u);
-    write_u32(fake_table + 123u * 4u, (DWORD)fake_model_a);
-    write_u32(fake_table + 456u * 4u, (DWORD)fake_model_b);
-    write_float(
-        fake_model_a + MODEL_INFO_DRAW_DISTANCE_OFFSET,
-        40.0f);
-    write_float(
-        fake_model_b + MODEL_INFO_DRAW_DISTANCE_OFFSET,
-        75.0f);
-
-    ZeroMemory(&g_report, sizeof(g_report));
-    g_definition_manager = fake_manager;
-    g_manager = fake_runtime_manager;
-    g_report.distance_multiplier = 50u;
-    if (!scale_procedural_model_draw_distances_from_table(
-            fake_table) ||
-        g_report.model_distance_status !=
-            MODEL_DISTANCE_APPLIED ||
-        g_report.model_distance_definitions_examined != 3u ||
-        g_report.model_distance_unique_models != 2u ||
-        g_report.model_distance_duplicate_references != 1u ||
-        g_report.model_distance_models_scaled != 2u ||
-        g_report.model_distance_models_clamped != 2u ||
-        g_report.model_distance_query_radius_bits != 0x42E60000u ||
-        read_u32(
-            fake_model_a + MODEL_INFO_DRAW_DISTANCE_OFFSET) !=
-            0x42E60000u ||
-        read_u32(
-            fake_model_b + MODEL_INFO_DRAW_DISTANCE_OFFSET) !=
-            0x42E60000u) {
-        goto cleanup;
-    }
-    result = 1u;
-
-cleanup:
-    if (fake_manager) {
-        VirtualFree(fake_manager, 0, MEM_RELEASE);
-    }
-    if (fake_runtime_manager) {
-        VirtualFree(fake_runtime_manager, 0, MEM_RELEASE);
-    }
-    if (fake_table) {
-        VirtualFree(fake_table, 0, MEM_RELEASE);
-    }
-    if (fake_model_a) {
-        VirtualFree(fake_model_a, 0, MEM_RELEASE);
-    }
-    if (fake_model_b) {
-        VirtualFree(fake_model_b, 0, MEM_RELEASE);
-    }
-    g_definition_manager = saved_definition_manager;
-    g_manager = saved_runtime_manager;
-    g_report = saved_report;
-    return result;
-}
-
-DWORD __cdecl
-GTAIVEFLCProceduralFixes_RunTuningSafetyGovernorFixture(void)
-{
-    struct PatchReport saved_report = g_report;
-    BYTE *saved_definition_manager = g_definition_manager;
-    BYTE *saved_runtime_manager = g_manager;
-    BYTE *saved_generator_manager = g_generator_manager;
-    DWORD saved_plant_multiplier = g_plant_density_multiplier;
-    float saved_proc_multiplier = g_procobj_density_multiplier;
-    DWORD saved_density_mask = g_density_class_mask;
-    static const BYTE density_classes[1] = {
-        DENSITY_CLASS_GRASS
-    };
-    DWORD saved_debug_log = g_debug_log_enabled;
-    DWORD saved_render_capacity = g_generator_render_capacity;
-    LONG saved_pressure_polls = InterlockedCompareExchange(
-        &g_tuning_governor_pressure_polls, 0, 0);
-    LONG saved_triggered = InterlockedCompareExchange(
-        &g_tuning_governor_triggered, 0, 0);
-    LONG saved_governor_state = InterlockedCompareExchange(
-        &g_tuning_governor_state, 0, 0);
-    LONG saved_event_pending = InterlockedCompareExchange(
-        &g_tuning_governor_event_pending, 0, 0);
-    struct GuBehaviorState saved_gu_behavior = g_gu_behavior;
-    BYTE *fake_definition_manager = NULL;
-    BYTE *fake_runtime_manager = NULL;
-    BYTE *fake_generator_manager = NULL;
-    BYTE *fake_table = NULL;
-    BYTE *fake_model = NULL;
-    BYTE *proc_record;
-    BYTE *plant_record;
-    DWORD index;
-    DWORD old_definition_protection = 0u;
-    DWORD result = 0u;
-
-    fake_definition_manager = (BYTE *)VirtualAlloc(
-        NULL, DEFINITION_MANAGER_REQUIRED_SIZE,
-        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    fake_runtime_manager = (BYTE *)VirtualAlloc(
-        NULL, MANAGER_MINIMUM_SIZE,
-        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    fake_generator_manager = (BYTE *)VirtualAlloc(
-        NULL, GENERATOR_MANAGER_MINIMUM_SIZE,
-        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    fake_table = (BYTE *)VirtualAlloc(
-        NULL, MODEL_INFO_TABLE_REQUIRED_SIZE,
-        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    fake_model = (BYTE *)VirtualAlloc(
-        NULL, MODEL_INFO_REQUIRED_SIZE,
-        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    if (!fake_definition_manager || !fake_runtime_manager ||
-        !fake_generator_manager || !fake_table || !fake_model) {
-        goto cleanup;
-    }
-    ZeroMemory(
-        fake_definition_manager,
-        DEFINITION_MANAGER_REQUIRED_SIZE);
-    ZeroMemory(fake_runtime_manager, MANAGER_MINIMUM_SIZE);
-    ZeroMemory(
-        fake_generator_manager,
-        GENERATOR_MANAGER_MINIMUM_SIZE);
-    ZeroMemory(fake_table, MODEL_INFO_TABLE_REQUIRED_SIZE);
-    ZeroMemory(fake_model, MODEL_INFO_REQUIRED_SIZE);
-
-    write_u32(
-        fake_definition_manager +
-        DEFINITION_PROCOBJ_COUNT_OFFSET, 1u);
-    write_u32(
-        fake_definition_manager +
-        DEFINITION_PLANT_COUNT_OFFSET, 1u);
-    proc_record = fake_definition_manager +
-        DEFINITION_PROCOBJ_RECORDS_OFFSET;
-    plant_record = fake_definition_manager +
-        DEFINITION_PLANT_RECORDS_OFFSET;
-    write_u32(
-        proc_record + DEFINITION_PROCOBJ_MODEL_INDEX_OFFSET,
-        123u);
-    write_float(
-        proc_record + DEFINITION_PROCOBJ_SPACING_OFFSET,
-        10.0f);
-    write_float(
-        proc_record + DEFINITION_PROCOBJ_INVERSE_SQUARE_OFFSET,
-        0.01f);
-    write_float(
-        plant_record + DEFINITION_PLANT_DENSITY_OFFSET,
-        0.8f);
-    write_float(
-        fake_runtime_manager + MANAGER_QUERY_RADIUS_OFFSET,
-        115.0f);
-    write_u32(fake_table + 123u * 4u, (DWORD)fake_model);
-    write_float(
-        fake_model + MODEL_INFO_DRAW_DISTANCE_OFFSET,
-        40.0f);
-    /* Begin with the exact BLD0035 false-positive state: all 512 built-in
-     * wrappers are off the free list, while rendered/staging counts are zero. */
-    write_u32(
-        fake_generator_manager + GENERATOR_FREE_COUNT_OFFSET, 0u);
-    write_u32(
-        fake_generator_manager + GENERATOR_STAGING_CAPACITY_OFFSET,
-        VANILLA_RENDERED_OBJECT_CAPACITY);
-    write_u32(
-        fake_generator_manager + GENERATOR_STAGING_BUFFER_OFFSET,
-        (DWORD)fake_generator_manager);
-    write_u16(
-        fake_generator_manager + GENERATOR_STAGING_COUNT_OFFSET, 0u);
-    write_u32(
-        fake_generator_manager +
-        GENERATOR_ACTIVE_RENDERED_COUNT_OFFSET, 0u);
-
-    ZeroMemory(&g_report, sizeof(g_report));
-    g_definition_manager = fake_definition_manager;
-    g_manager = fake_runtime_manager;
-    g_generator_manager = fake_generator_manager;
-    g_plant_density_multiplier = 50u;
-    g_procobj_density_multiplier = 2.0f;
-    g_density_class_mask = DENSITY_CLASS_MASK_GRASS;
-    g_debug_log_enabled = 0u;
-    g_generator_render_capacity = VANILLA_RENDERED_OBJECT_CAPACITY;
-    g_report.distance_multiplier = 50u;
-    g_report.plant_density_multiplier = 50u;
-    g_report.procobj_density_multiplier_bits =
-        read_u32((BYTE *)&g_procobj_density_multiplier);
-    g_report.density_class_mask = g_density_class_mask;
-    InterlockedExchange(&g_tuning_governor_pressure_polls, 0);
-    InterlockedExchange(&g_tuning_governor_triggered, 0);
-    InterlockedExchange(
-        &g_tuning_governor_state,
-        TUNING_GOVERNOR_STATE_IDLE);
-    InterlockedExchange(&g_tuning_governor_event_pending, 0);
-    InterlockedExchange(&g_gu_behavior.enabled, 0);
-
-    reset_definition_scaling_tracking();
-    g_report.procobj_definition_count = 1u;
-    g_report.plant_definition_count = 1u;
-    if (!scale_loaded_definitions_for_catalog(
-            1u, 1u, density_classes)) {
-        goto cleanup;
-    }
-    if (LEGACY_MODEL_GLOBAL_DRAW_DISTANCE_MUTATION_ENABLED) {
-        if (!scale_procedural_model_draw_distances_from_table(
-                fake_table)) {
-            goto cleanup;
-        }
-    } else {
-        g_report.model_distance_status =
-            MODEL_DISTANCE_RETIRED_GLOBAL_MUTATION;
-    }
-    if (read_u32(
-            fake_model + MODEL_INFO_DRAW_DISTANCE_OFFSET) !=
-            0x42200000u) {
-        goto cleanup;
-    }
-    g_report.tuning_governor_active = 1u;
-    for (index = 0u;
-         index < TUNING_GOVERNOR_SUSTAINED_POLLS + 2u;
-         ++index) {
-        tuning_safety_governor_poll();
-    }
-    if (g_report.tuning_governor_triggered != 0u ||
-        g_report.tuning_governor_active != 1u ||
-        g_report.tuning_governor_pressure_polls != 0u) {
-        goto cleanup;
-    }
-    /*
-     * The observation-only trigger must remain safe even when every tracked
-     * definition byte is read-only. Any attempted rollback write makes this
-     * fixture fail at the process level instead of being mistaken for a pass.
-     */
-    if (!VirtualProtect(
-            fake_definition_manager,
-            DEFINITION_MANAGER_REQUIRED_SIZE,
-            PAGE_READONLY, &old_definition_protection)) {
-        goto cleanup;
-    }
-
-    write_u16(
-        fake_generator_manager + GENERATOR_STAGING_COUNT_OFFSET,
-        (WORD)tuning_governor_near_capacity_threshold(
-            VANILLA_RENDERED_OBJECT_CAPACITY));
-    for (index = 0u;
-         index < TUNING_GOVERNOR_SUSTAINED_POLLS;
-         ++index) {
-        tuning_safety_governor_poll();
-    }
-    if (g_report.tuning_governor_triggered != 1u ||
-        g_report.tuning_governor_reason !=
-            TUNING_GOVERNOR_REASON_PRESSURE ||
-        g_report.tuning_governor_live_writes != 0u ||
-        g_report.tuning_governor_active != 0u ||
-        g_report.tuning_governor_state !=
-            TUNING_GOVERNOR_STATE_RESTART_REQUIRED ||
-        (DWORD)InterlockedCompareExchange(
-            &g_tuning_governor_state, 0, 0) !=
-            TUNING_GOVERNOR_STATE_RESTART_REQUIRED ||
-        g_report.tuning_governor_detection_thread_id !=
-            GetCurrentThreadId() ||
-        InterlockedCompareExchange(
-            &g_tuning_governor_event_pending, 0, 0) != 1 ||
-        g_report.tuning_governor_pressure_polls !=
-            TUNING_GOVERNOR_SUSTAINED_POLLS ||
-        g_report.definition_scaling_status !=
-            DEFINITION_SCALING_APPLIED ||
-        read_u32(
-            proc_record +
-            DEFINITION_PROCOBJ_INVERSE_SQUARE_OFFSET) !=
-            0x3CA3D70Au) {
-        goto cleanup;
-    }
-    if (g_report.model_distance_status !=
-            MODEL_DISTANCE_RETIRED_GLOBAL_MUTATION ||
-        read_u32(
-            proc_record + DEFINITION_PROCOBJ_SPACING_OFFSET) !=
-            g_report.procobj_scaled_spacing_min_bits ||
-        read_u32(
-            proc_record +
-            DEFINITION_PROCOBJ_INVERSE_SQUARE_OFFSET) !=
-            0x3CA3D70Au ||
-        read_u32(
-            plant_record + DEFINITION_PLANT_DENSITY_OFFSET) !=
-            0x3F4CCCCDu ||
-        read_u32(
-            fake_model + MODEL_INFO_DRAW_DISTANCE_OFFSET) !=
-            0x42200000u) {
-        goto cleanup;
-    }
-    result = 1u;
-
-cleanup:
-    if (fake_definition_manager) {
-        VirtualFree(fake_definition_manager, 0, MEM_RELEASE);
-    }
-    if (fake_runtime_manager) {
-        VirtualFree(fake_runtime_manager, 0, MEM_RELEASE);
-    }
-    if (fake_generator_manager) {
-        VirtualFree(fake_generator_manager, 0, MEM_RELEASE);
-    }
-    if (fake_table) {
-        VirtualFree(fake_table, 0, MEM_RELEASE);
-    }
-    if (fake_model) {
-        VirtualFree(fake_model, 0, MEM_RELEASE);
-    }
-    g_definition_manager = saved_definition_manager;
-    g_manager = saved_runtime_manager;
-    g_generator_manager = saved_generator_manager;
-    g_plant_density_multiplier = saved_plant_multiplier;
-    g_procobj_density_multiplier = saved_proc_multiplier;
-    g_density_class_mask = saved_density_mask;
-    g_debug_log_enabled = saved_debug_log;
-    g_generator_render_capacity = saved_render_capacity;
-    InterlockedExchange(
-        &g_tuning_governor_pressure_polls, saved_pressure_polls);
-    InterlockedExchange(&g_tuning_governor_triggered, saved_triggered);
-    InterlockedExchange(
-        &g_tuning_governor_state, saved_governor_state);
-    InterlockedExchange(
-        &g_tuning_governor_event_pending, saved_event_pending);
-    g_gu_behavior = saved_gu_behavior;
-    g_report = saved_report;
-    return result;
-}
-
-struct BackgroundGateFixtureContext {
-    volatile LONG stop;
-    volatile LONG entered;
-    volatile LONG passed;
-};
-
-static DWORD WINAPI background_gate_fixture_thread(LPVOID parameter)
-{
-    struct BackgroundGateFixtureContext *context =
-        (struct BackgroundGateFixtureContext *)parameter;
-    if (!context) {
-        return 1u;
-    }
-    InterlockedExchange(&context->entered, 1);
-    if (!wait_for_background_threads_ready(&context->stop)) {
-        return 1u;
-    }
-    InterlockedExchange(&context->passed, 1);
-    return 0u;
-}
-
-DWORD __cdecl
-GTAIVEFLCProceduralFixes_RunBackgroundStartupGateFixture(void)
-{
-    struct BackgroundGateFixtureContext context;
-    LONG saved_ready = InterlockedCompareExchange(
-        &g_background_threads_ready, 0, 0);
-    HANDLE thread;
-    DWORD exit_code = 1u;
-    DWORD result = 0u;
-    DWORD wait_index;
-
-    ZeroMemory(&context, sizeof(context));
-    InterlockedExchange(&g_background_threads_ready, 0);
-    thread = CreateThread(
-        NULL, 0u, background_gate_fixture_thread,
-        &context, 0u, NULL);
-    if (!thread) {
-        InterlockedExchange(&g_background_threads_ready, saved_ready);
-        return 0u;
-    }
-    for (wait_index = 0u; wait_index < 2000u; ++wait_index) {
-        if (InterlockedCompareExchange(
-                &context.entered, 0, 0) != 0) {
-            break;
-        }
-        Sleep(1u);
-    }
-    if (InterlockedCompareExchange(&context.entered, 0, 0) != 1) {
-        goto cleanup;
-    }
-    if (InterlockedCompareExchange(&context.passed, 0, 0) != 0) {
-        goto cleanup;
-    }
-    InterlockedExchange(&g_background_threads_ready, 1);
-    if (WaitForSingleObject(thread, 2000u) != WAIT_OBJECT_0 ||
-        !GetExitCodeThread(thread, &exit_code) ||
-        exit_code != 0u ||
-        InterlockedCompareExchange(&context.passed, 0, 0) != 1) {
-        goto cleanup;
-    }
-    result = 1u;
-
-cleanup:
-    InterlockedExchange(&context.stop, 1);
-    InterlockedExchange(&g_background_threads_ready, 1);
-    if (WaitForSingleObject(thread, 2000u) != WAIT_OBJECT_0) {
-        /* The context is stack-owned; never return while the worker can use it. */
-        ExitProcess(24u);
-    }
-    CloseHandle(thread);
-    InterlockedExchange(&g_background_threads_ready, saved_ready);
-    return result;
-}
-
-DWORD __cdecl
-GTAIVEFLCProceduralFixes_RunTargetedExceptionPredicateFixture(void)
-{
-    EXCEPTION_RECORD record;
-    CONTEXT context;
-    EXCEPTION_POINTERS pointers;
-    HMODULE kernel32 = GetModuleHandleA("kernel32.dll");
-
-    ZeroMemory(&record, sizeof(record));
-    ZeroMemory(&context, sizeof(context));
-    pointers.ExceptionRecord = &record;
-    pointers.ContextRecord = &context;
-    record.ExceptionCode = EXCEPTION_ACCESS_VIOLATION;
-    record.ExceptionAddress =
-        (PVOID)(
-            g_report.image_base +
-            PROCEDURAL_CODE_FIRST_RVA + 0x100u);
-    record.NumberParameters = 2u;
-    record.ExceptionInformation[0] = 0u;
-    record.ExceptionInformation[1] = 0x00001E00u;
-    if (!provider_exception_is_relevant(&pointers)) {
-        return 0u;
-    }
-
-    record.ExceptionAddress = (PVOID)kernel32;
-    if (provider_exception_is_relevant(&pointers)) {
-        return 0u;
-    }
-    return 1u;
-}
-#endif
+#endif /* GTAIVPOOL_TEST_NO_FATAL */
 
 static DWORD WINAPI startup_worker_main(LPVOID parameter)
 {
@@ -16809,11 +14400,8 @@ static DWORD WINAPI startup_worker_main(LPVOID parameter)
     }
     if (g_report.status == STATUS_PATCH_APPLIED) {
         (void)initialize_minidump_writer();
-        g_clean_exit_flush_registered =
-            atexit(flush_flight_recorder_on_clean_exit) == 0 ? 1u : 0u;
         install_crash_dump_handler();
         install_targeted_exception_logger();
-        start_telemetry();
         start_hang_watchdog();
         write_log();
         /*

@@ -15,14 +15,15 @@
 #define GU_DENSITY_MULTIPLIER_MIN 0.1f
 #define GU_DENSITY_MULTIPLIER_MAX 2.0f
 
-#define GU_SOURCE_BUFFER_CAPACITY 32768u
+#define GU_SOURCE_BUFFER_CAPACITY 8192u
 #define GU_EVENT_RING_CAPACITY 8192u
 #define GU_EVENT_RING_MASK (GU_EVENT_RING_CAPACITY - 1u)
 #define GU_EVENT_TYPE_COUNT 32u
 #define GU_EVENT_CAS_RETRIES 8u
-#define GU_FLIGHT_RECORDER_CAPACITY 4096u
-#define GU_FLIGHT_RECORDER_MASK (GU_FLIGHT_RECORDER_CAPACITY - 1u)
-#define GU_OWNERSHIP_CAPACITY 65536u
+/* Open-addressing hash with a 32-probe window. Must stay a power of two and
+ * keep the load at or below 25% at the rendered-object ceiling (checked at
+ * compile time in GTAIVProceduralPool.c). 65536 only added cache footprint. */
+#define GU_OWNERSHIP_CAPACITY 32768u
 #define GU_OWNERSHIP_MASK (GU_OWNERSHIP_CAPACITY - 1u)
 #define GU_OWNERSHIP_PROBES 32u
 #define GU_OWNERSHIP_RETRIES 64u
@@ -128,23 +129,6 @@ struct GuEventDrainSummary {
     struct GuRawEvent last_by_type[GU_EVENT_TYPE_COUNT];
 };
 
-/*
- * Retrospective overwrite history. Unlike GuEventRing, records are not
- * consumed by telemetry. A capture freezes producers and copies only slots
- * whose commit sequence proves that the fixed-size record is coherent.
- */
-struct GuFlightRecorderSlot {
-    volatile LONG committed_sequence;
-    struct GuRawEvent event;
-};
-
-struct GuFlightRecorder {
-    volatile LONG next_sequence;
-    volatile LONG frozen;
-    volatile LONG lost_frozen;
-    struct GuFlightRecorderSlot slots[GU_FLIGHT_RECORDER_CAPACITY];
-};
-
 struct GuOwnedRecord {
     volatile LONG wrapper_key;
     volatile LONG entity_key;
@@ -177,7 +161,6 @@ struct GuOwnershipTable {
 
 extern struct GuEventRing g_gu_event_ring;
 extern struct GuEventDrainSummary g_gu_event_summary;
-extern struct GuFlightRecorder g_gu_flight_recorder;
 extern struct GuOwnershipTable g_gu_ownership;
 extern DWORD g_gu_source_buffer[GU_SOURCE_BUFFER_CAPACITY];
 extern float g_gu_source_radius;
@@ -193,14 +176,6 @@ DWORD gu_event_drain(
     struct GuEventRing *ring,
     struct GuEventDrainSummary *summary,
     DWORD maximum_events);
-void gu_flight_recorder_initialize(struct GuFlightRecorder *recorder);
-void gu_flight_recorder_freeze(struct GuFlightRecorder *recorder);
-void gu_flight_recorder_resume(struct GuFlightRecorder *recorder);
-DWORD gu_flight_recorder_snapshot(
-    const struct GuFlightRecorder *recorder,
-    struct GuRawEvent *events, DWORD event_capacity,
-    DWORD *first_sequence, DWORD *next_sequence,
-    DWORD *lost_frozen);
 
 void gu_ownership_initialize(struct GuOwnershipTable *table);
 int gu_ownership_insert(
