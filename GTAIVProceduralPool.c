@@ -108,7 +108,7 @@ struct GuStartupQuiescence {
 #define DEFAULT_RENDERED_OBJECT_CAPACITY 8192u
 #define VANILLA_RENDERED_OBJECT_CAPACITY 512u
 #define MIN_RENDERED_OBJECT_CAPACITY 512u
-#define MAX_RENDERED_OBJECT_CAPACITY 8192u
+#define MAX_RENDERED_OBJECT_CAPACITY 16384u
 typedef char gu_ownership_capacity_is_power_of_two[
     ((GU_OWNERSHIP_CAPACITY & (GU_OWNERSHIP_CAPACITY - 1u)) == 0u) ? 1 : -1];
 typedef char gu_ownership_capacity_load_check[
@@ -122,7 +122,7 @@ typedef char gu_ownership_capacity_load_check[
 #define MAX_DISTANCE_MULTIPLIER 50u
 #define DEFAULT_CORRECTED_DISTANCE_MULTIPLIER 1.0f
 #define MIN_CORRECTED_DISTANCE_MULTIPLIER 0.5f
-#define MAX_CORRECTED_DISTANCE_MULTIPLIER 1.5f
+#define MAX_CORRECTED_DISTANCE_MULTIPLIER 3.0f
 /*
  * Retained VCNE telemetry exhausted the former 4096-record automatic
  * baseline during a neutral one-hour session (4008 high-watermark plus
@@ -6298,9 +6298,9 @@ static void build_log(void)
     log_append("- the configurable capacity expands three 0x60-byte surface arrays.\r\n");
     log_append("- a separate downstream generator owns 512 embedded 0x18-byte\r\n");
     log_append("  live-object wrappers and separate 512 rendered/staging limits.\r\n");
-    log_append("- this build permits RenderedObjectCapacity from 512 to 8,192.\r\n");
+    log_append("- this build permits RenderedObjectCapacity from 512 to 16,384.\r\n");
     log_append("  Values above 512 use the exact-profile allocator, eviction, activation,\r\n");
-    log_append("  and staging patch set; 8,192 is the hard ceiling.\r\n");
+    log_append("  and staging patch set; 16,384 is the hard ceiling.\r\n");
     if (g_build_profile->provider_supported) {
         log_append("- auto always selects GTA IV's vanilla ProviderCapacity=40.\r\n");
         log_append("  Manual values above 40 are refused after owner-observed LOD flicker\r\n");
@@ -7294,7 +7294,7 @@ static void write_telemetry_sample(
 
     log_append(
         "\r\nDownstream rendered procedural-object generator "
-        "(vanilla 512; bounded expansion up to 8,192):\r\n");
+        "(vanilla 512; bounded expansion up to 16,384):\r\n");
     log_key_u32(
         "Generator manager readable",
         snapshot->generator_readable);
@@ -7944,7 +7944,8 @@ static void log_extras_runtime(DWORD sample_number)
 {
     const struct GuExtrasReport *r = &g_gu_extras_report;
     if (r->matrix_status != GU_X_ON && r->reflections_status != GU_X_ON &&
-        r->cone_status != GU_X_ON) {
+        r->cone_status != GU_X_ON && r->drawable_status != GU_X_ON &&
+        r->spawn_status != GU_X_ON) {
         return;
     }
     telemetry_begin_block("EXTRAS RUNTIME");
@@ -7954,12 +7955,23 @@ static void log_extras_runtime(DWORD sample_number)
     if (r->cone_status == GU_X_ON) {
         log_key_u32("Cone hook memory faults contained (feature off after the first)", r->cone_faults);
     }
+    if (r->spawn_status == GU_X_ON) {
+        log_key_u32("Spawn limit memory faults contained (feature off after the first)", r->spawn_faults);
+        log_key_u32("Spawn limit updates that held props back", r->spawn_limited_updates);
+        log_key_u32("Spawn limit props held back in total", r->spawn_held_total);
+        log_key_u32("Spawn limit most props waiting at once", r->spawn_hold_max);
+        log_key_u32("Spawn limit waiting props dropped (provider removed)", r->spawn_dropped_removed);
+    }
     log_key_u32("Sample", sample_number);
     if (r->matrix_status == GU_X_ON) {
         log_key_u32("Matrix pool allocations by the pool hook", r->matrix_pool_allocs);
         log_key_u32("Matrix pool allocations that fell back to the game", r->matrix_pool_alloc_fallbacks);
         log_key_u32("Matrix pool releases of our pool", r->matrix_pool_frees_ours);
         log_key_u32("Matrix pool releases forwarded to the game", r->matrix_pool_frees_forwarded);
+    }
+    if (r->drawable_status == GU_X_ON) {
+        log_key_u32("Drawable refs array allocations by the hook", r->drawable_allocs);
+        log_key_u32("Drawable refs allocations that fell back to the game", r->drawable_alloc_fallbacks);
     }
     if (r->reflections_status == GU_X_ON) {
         log_key_u32("Reflection calls with a reflection phase", r->reflections_candidates);
@@ -12855,6 +12867,11 @@ static void install_extras(struct GuStartupQuiescence *guard, BYTE *image_base)
     config.cone_full_angle_deg = read_extras_u32("ConeFullAngle", 75u, 30u, 120u);
     config.cone_release_per_update = read_extras_u32("ConeReleasePerUpdate", 384u, 0u, 8192u);
     config.cone_lead_ms = read_extras_u32("ConeTurnLeadMs", 300u, 0u, 1000u);
+    config.drawable_refs = read_extras_u32("DrawableRefs", 0u, 13000u, 200000u);
+    config.render_cache = read_extras_u32("RenderCache", 0u, 9692u, 1048576u);
+    config.drawable_own_memory = read_extras_u32("DrawableRefsOwnMemory", 1u, 0u, 1u);
+    config.spawns_per_update = read_extras_u32("SpawnsPerUpdate", 0u, 16u, 8192u);
+    config.spawn_near_always = read_extras_u32("SpawnNearAlways", 50u, 0u, 500u);
     config.is_prop_entity = extras_is_prop_entity;
     (void)gu_extras_install(&config, image_base, g_build_profile->image_size,
                             g_manager, extras_addr_busy, guard);
@@ -12871,6 +12888,11 @@ static void log_extras_report(void)
     log_key_u32("Matrix limit sites in original form (0 = already raised by the main fix)", r->matrix_limit_sites_original);
     log_key_u32("Reflections status", r->reflections_status);
     log_key_u32("Cone status (6 camera, 7 config)", r->cone_status);
+    log_key_u32("Drawable refs status (8 = the game already has that many)", r->drawable_status);
+    log_key_u32("Drawable refs applied", r->drawable_refs_applied);
+    log_key_u32("Render cache status (8 = the game already has that many)", r->render_cache_status);
+    log_key_u32("Render cache applied", r->render_cache_applied);
+    log_key_u32("Spawn limit status (6 camera, 7 config)", r->spawn_status);
     for (i = 0u; i < r->sites_known && i < GU_X_SITE_COUNT; ++i) {
         if (r->site_matches[i] == 0u && r->site_rva[i] == 0u) continue;
         log_append(r->site_name[i] ? r->site_name[i] : "site");

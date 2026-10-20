@@ -37,7 +37,8 @@ enum GuExtrasStatus {
     GU_X_ERR_MEMORY = 4,     /* allocation or protection failed */
     GU_X_ERR_WRITE = 5,      /* write or read-back verification failed (reverted) */
     GU_X_ERR_CAMERA = 6,     /* camera globals not found or implausible */
-    GU_X_ERR_CONFIG = 7      /* needs another piece that is missing */
+    GU_X_ERR_CONFIG = 7,     /* needs another piece that is missing */
+    GU_X_NOT_NEEDED = 8      /* the game (or another mod) already has at least that much */
 };
 
 struct GuExtrasConfig {
@@ -48,17 +49,27 @@ struct GuExtrasConfig {
     uint32_t cone_full_angle_deg;     /* 30..120: full radius inside this half angle */
     uint32_t cone_release_per_update; /* 0 = unlimited, else parked props made per update */
     uint32_t cone_lead_ms;            /* turn prediction, 0..1000 */
+    uint32_t drawable_refs;           /* 0 = off, else 13000..200000 (the game has 13000) */
+    uint32_t render_cache;            /* 0 = off, else 9692..1048576 entities a frame can draw */
+    uint32_t drawable_own_memory;     /* 1 = the new array comes from our memory, 0 = from the game's allocator */
+    uint32_t spawns_per_update;       /* 0 = off, else 16..8192 props made per generator update */
+    uint32_t spawn_near_always;       /* metres: props this close are always made at once (0..500) */
     /* provided by the host */
     int (*is_prop_entity)(uint32_t entity); /* NULL = flags test only */
 };
 
 struct GuExtrasReport {
     uint32_t matrix_status, reflections_status, cone_status;
+    uint32_t drawable_status, render_cache_status, spawn_status;
+    uint32_t drawable_refs_applied, render_cache_applied;
+    volatile uint32_t drawable_allocs, drawable_alloc_fallbacks;
     uint32_t matrix_limit_applied, matrix_pool_applied;
     uint32_t matrix_limit_sites_original;   /* 1 = the two 0x200 immediates were still original */
     /* SEH guard: a memory fault inside a hook switches that feature off */
     volatile uint32_t reflections_faults, reflections_disabled;
     volatile uint32_t cone_faults, cone_disabled;
+    volatile uint32_t spawn_faults, spawn_disabled;
+    volatile uint32_t spawn_limited_updates, spawn_held_total, spawn_hold_max, spawn_dropped_removed;
     uint32_t site_matches[GU_X_SITE_COUNT];   /* matches found (0, 1, 2 = more than one) */
     uint32_t site_rva[GU_X_SITE_COUNT];       /* RVA of the first match */
     const char *site_name[GU_X_SITE_COUNT];

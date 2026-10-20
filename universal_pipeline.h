@@ -22,8 +22,8 @@
 #define GU_EVENT_CAS_RETRIES 8u
 /* Open-addressing hash with a 32-probe window. Must stay a power of two and
  * keep the load at or below 25% at the rendered-object ceiling (checked at
- * compile time in GTAIVProceduralPool.c). 65536 only added cache footprint. */
-#define GU_OWNERSHIP_CAPACITY 32768u
+ * compile time in GTAIVProceduralPool.c): 4 x 16384 = 65536. */
+#define GU_OWNERSHIP_CAPACITY 65536u
 #define GU_OWNERSHIP_MASK (GU_OWNERSHIP_CAPACITY - 1u)
 #define GU_OWNERSHIP_PROBES 32u
 #define GU_OWNERSHIP_RETRIES 64u

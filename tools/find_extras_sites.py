@@ -27,7 +27,11 @@ PATTERNS = [
     ("cone.reset",       "FF B5 24 52 00 00 E8"),
     ("cone.destructor",  "FF B6 24 52 00 00 E8"),
     ("cone.camera",      "F3 0F 10 05 ? ? ? ? F3 0F 10 15 ? ? ? ? F3 0F 10 0D ? ? ? ? 56 8B 75 0C"),
+    ("drawable.refs",    "68 ? ? ? ? E8 ? FF FF FF C3"),
+    ("rendercache.scans","E8 ? ? ? ? 8B 0D ? ? ? ? 2B C8 83 E1 F8 81 F9 00 00 01 00"),
+    ("spawn.after",      "66 89 86 30 52 00 00 8B CE 5E E9"),
 ]
+EXPECTED = {"rendercache.scans": 2}      # the render-cache scans exist twice; every other site once
 
 def compile_pattern(text):
     parts = []
@@ -73,10 +77,11 @@ def report(data, image_base, secs, results):
     print("image base (preferred): 0x%08X" % image_base)
     for name, pat in PATTERNS:
         hits = results[name]
-        flag = "OK " if len(hits) == 1 else "BAD"
-        if len(hits) != 1:
+        want = EXPECTED.get(name, 1)
+        flag = "OK " if len(hits) == want else "BAD"
+        if len(hits) != want:
             ok = False
-        print("%s %-18s %d match%s" % (flag, name, len(hits), "" if len(hits) == 1 else "es"))
+        print("%s %-18s %d match%s (expected %d)" % (flag, name, len(hits), "" if len(hits) == 1 else "es", want))
         for rva, b in hits[:5]:
             print("      RVA 0x%08X  %s" % (rva, b.hex(" ")))
     cam = results["cone.camera"]
@@ -85,19 +90,20 @@ def report(data, image_base, secs, results):
         rva = operand - image_base
         print("camera position operand: 0x%08X  -> RVA 0x%08X %s" %
               (operand, rva, "(expected 0x00E8E340)" if rva == 0xE8E340 else "(DIFFERENT from 0x00E8E340)"))
-    print("\nAll patterns match exactly once." if ok else
-          "\nSome patterns do not match exactly once: the matching feature will stay off.")
+    print("\nAll patterns match the expected number of times." if ok else
+          "\nSome patterns do not match the expected number of times: the matching feature will stay off.")
     return ok
 
 def selftest():
-    code = bytearray(b"\xCC" * 0x400)
+    code = bytearray(b"\xCC" * 0x600)
     off = 0x10
     for name, pat in PATTERNS:
-        for tok in pat.split():
-            code[off] = 0x00 if tok == "?" else int(tok, 16); off += 1
-        off += 8
+        for _ in range(EXPECTED.get(name, 1)):
+            for tok in pat.split():
+                code[off] = 0x00 if tok == "?" else int(tok, 16); off += 1
+            off += 8
     # camera operand: preferred base 0x400000 + RVA 0xE8E340
-    cam_off = 0x10 + sum(len(p.split()) + 8 for _, p in PATTERNS[:-1])
+    cam_off = 0x10 + sum((len(p.split()) + 8) * EXPECTED.get(n, 1) for n, p in PATTERNS[:11])
     struct.pack_into("<I", code, cam_off + 12, 0x400000 + 0xE8E340)
     hdr = bytearray(0x200)
     hdr[0:2] = b"MZ"; struct.pack_into("<I", hdr, 0x3C, 0x80)
@@ -112,7 +118,7 @@ def selftest():
     data = bytes(hdr) + bytes(code)
     base, secs = parse_pe(data)
     res = scan(data, base, secs)
-    ok = all(len(h) == 1 for h in res.values())
+    ok = all(len(h) == EXPECTED.get(n, 1) for n, h in res.items())
     cam = struct.unpack_from("<I", res["cone.camera"][0][1], 12)[0] - base
     ok = ok and cam == 0xE8E340
     # a duplicate must be reported as BAD

@@ -86,11 +86,17 @@ static int gu_x_fault_filter(unsigned long code)
 }
 #define GU_X_TRY __try
 #define GU_X_EXCEPT __except (gu_x_fault_filter(GetExceptionCode()))
+#elif defined(GU_X_TEST)
+/* Linux tests: a SIGSEGV handler jumps back here (see extras_tests). */
+extern void *gu_xt_jb[5];
+extern volatile int gu_xt_guard;
+#define GU_X_TRY if (gu_xt_guard = 1, !__builtin_setjmp(gu_xt_jb))
+#define GU_X_EXCEPT else
 #else
 #define GU_X_TRY if (1)
 #define GU_X_EXCEPT else
 #endif
-static volatile uint32_t g_refl_disabled, g_cone_disabled;
+static volatile uint32_t g_refl_disabled, g_cone_disabled, g_spawn_disabled;
 
 /* ------------------------------------------------------------------ */
 /* small helpers                                                       */
@@ -171,14 +177,14 @@ static uint32_t pat_parse(const char *s, uint8_t *bytes, uint8_t *mask)
 struct Range { const uint8_t *p; uint32_t n; };
 
 /* counts matches over all ranges (stops counting at 2); first match returned */
-static const uint8_t *scan_unique(const struct Range *ranges, uint32_t nranges,
-                                  const char *pattern, uint32_t *matches)
+/* counts matches over all ranges up to `cap`; keeps the first two */
+static void scan_pattern(const struct Range *ranges, uint32_t nranges, const char *pattern,
+                         uint32_t cap, const uint8_t **first, const uint8_t **second, uint32_t *matches)
 {
     uint8_t b[X_PAT_MAX], m[X_PAT_MAX];
     uint32_t plen = pat_parse(pattern, b, m), r, i, j;
-    const uint8_t *first = 0;
-    *matches = 0;
-    if (plen == 0) return 0;
+    *matches = 0; *first = 0; *second = 0;
+    if (plen == 0) return;
     for (r = 0; r < nranges; ++r) {
         const uint8_t *t = ranges[r].p;
         uint32_t n = ranges[r].n;
@@ -188,24 +194,26 @@ static const uint8_t *scan_unique(const struct Range *ranges, uint32_t nranges,
             for (j = 1; j < plen; ++j)
                 if (m[j] && t[i + j] != b[j]) break;
             if (j == plen) {
-                if (*matches == 0) first = t + i;
-                if (++*matches >= 2) return first;
+                if (*matches == 0) *first = t + i;
+                else if (*matches == 1) *second = t + i;
+                if (++*matches >= cap) return;
             }
         }
     }
-    return first;
 }
 
 enum {
     S_M1, S_M2, S_M3, S_M4, S_M5,
     S_R0, S_RA, S_RB,
     S_C1, S_C3, S_C4, S_CAM,
+    S_D1, S_RC, S_C2,
     S_COUNT
 };
 static const char *const k_site_name[S_COUNT] = {
     "matrix.limit.a", "matrix.limit.b", "matrix.pool.size", "matrix.pool.alloc",
     "matrix.pool.free", "refl.phases", "refl.list.a", "refl.list.b",
-    "cone.before", "cone.reset", "cone.destructor", "cone.camera"
+    "cone.before", "cone.reset", "cone.destructor", "cone.camera",
+    "drawable.refs", "rendercache.scans", "spawn.after"
 };
 static const char *const k_site_pat[S_COUNT] = {
     "81 3D ? ? ? ? 00 02 00 00 7C ? 57 B9",
@@ -219,25 +227,30 @@ static const char *const k_site_pat[S_COUNT] = {
     "33 C0 33 FF 66 3B 86 28 52 00 00",
     "FF B5 24 52 00 00 E8",
     "FF B6 24 52 00 00 E8",
-    "F3 0F 10 05 ? ? ? ? F3 0F 10 15 ? ? ? ? F3 0F 10 0D ? ? ? ? 56 8B 75 0C"
+    "F3 0F 10 05 ? ? ? ? F3 0F 10 15 ? ? ? ? F3 0F 10 0D ? ? ? ? 56 8B 75 0C",
+    "68 ? ? ? ? E8 ? FF FF FF C3",
+    "E8 ? ? ? ? 8B 0D ? ? ? ? 2B C8 83 E1 F8 81 F9 00 00 01 00",
+    "66 89 86 30 52 00 00 8B CE 5E E9"
 };
 
 static const uint8_t *g_site[S_COUNT];
+static const uint8_t *g_site2[S_COUNT];   /* second match, only for the render-cache scans */
 
 static int resolve(uint32_t site_mask, const struct Range *ranges, uint32_t nranges,
                    const uint8_t *image_base)
 {
     uint32_t i, all_ok = 1;
     for (i = 0; i < S_COUNT; ++i) {
-        uint32_t matches = 0;
-        const uint8_t *p;
+        uint32_t matches = 0, want = (i == S_RC) ? 2u : 1u;   /* the render-cache scans exist twice */
+        const uint8_t *p, *p2;
         g_gu_extras_report.site_name[i] = k_site_name[i];
         if (!(site_mask & (1u << i))) continue;
-        p = scan_unique(ranges, nranges, k_site_pat[i], &matches);
+        scan_pattern(ranges, nranges, k_site_pat[i], 3u, &p, &p2, &matches);
         g_gu_extras_report.site_matches[i] = matches;
         g_gu_extras_report.site_rva[i] = p ? (uint32_t)(p - image_base) : 0;
-        g_site[i] = (matches == 1) ? p : 0;
-        if (matches != 1) all_ok = 0;
+        g_site[i] = (matches == want) ? p : 0;
+        g_site2[i] = (matches == want) ? p2 : 0;
+        if (matches != want) all_ok = 0;
     }
     g_gu_extras_report.sites_known = S_COUNT;
     return all_ok;
@@ -582,6 +595,14 @@ static uint8_t *g_manager;
 static float g_back, g_cos_full;
 static uint32_t g_release, g_lead_ms;
 static int g_prev_valid;
+/* spawn limit (and which of the two queue features are on) */
+#define X_SPAWN_MAX 16384u
+static int g_cone_on, g_spawn_on;
+static uint8_t *g_hold, *g_scratch;
+static float *g_sp_key, *g_sp_d2, *g_sp_tk;
+static uint32_t *g_sp_idx, *g_sp_ti;
+static uint32_t g_hold_count, g_carried, g_spawn_budget;
+static float g_spawn_near2;
 static float g_prev_f[3], g_prev_pos[3];
 static uint32_t g_prev_us;
 static uint32_t g_cand_idx[X_CAND_MAX];
@@ -595,7 +616,7 @@ struct Frame {
     float back, back2, ahead, ahead2, cos_full;
 };
 
-static void sort_pairs(float *key, uint32_t *idx, uint32_t n)
+static void sort_pairs_with(float *key, uint32_t *idx, uint32_t n, float *tk, uint32_t *ti)
 {
     uint32_t width, lo, mid, hi, a, b, k, i;
     for (width = 1; width < n; width *= 2) {
@@ -604,14 +625,19 @@ static void sort_pairs(float *key, uint32_t *idx, uint32_t n)
             hi = lo + 2 * width; if (hi > n) hi = n;
             a = lo; b = mid; k = lo;
             while (a < mid && b < hi) {
-                if (key[b] < key[a]) { g_tmp_key[k] = key[b]; g_tmp_idx[k++] = idx[b++]; }
-                else { g_tmp_key[k] = key[a]; g_tmp_idx[k++] = idx[a++]; }
+                if (key[b] < key[a]) { tk[k] = key[b]; ti[k++] = idx[b++]; }
+                else { tk[k] = key[a]; ti[k++] = idx[a++]; }
             }
-            while (a < mid) { g_tmp_key[k] = key[a]; g_tmp_idx[k++] = idx[a++]; }
-            while (b < hi)  { g_tmp_key[k] = key[b]; g_tmp_idx[k++] = idx[b++]; }
+            while (a < mid) { tk[k] = key[a]; ti[k++] = idx[a++]; }
+            while (b < hi)  { tk[k] = key[b]; ti[k++] = idx[b++]; }
         }
-        for (i = 0; i < n; ++i) { key[i] = g_tmp_key[i]; idx[i] = g_tmp_idx[i]; }
+        for (i = 0; i < n; ++i) { key[i] = tk[i]; idx[i] = ti[i]; }
     }
+}
+
+static void sort_pairs(float *key, uint32_t *idx, uint32_t n)
+{
+    sort_pairs_with(key, idx, n, g_tmp_key, g_tmp_idx);
 }
 
 static int in_cone(const struct Frame *c, const float *q)
@@ -647,7 +673,8 @@ static int make_frame(struct Frame *c)
     float ahead, l2, df[3], turn2, moved2, k, p2;
     uint32_t us, dt, i;
     float pf[3];
-    if (!g_cam || !g_manager) return 0;
+    if (!g_cam) return 0;
+    if (g_cone_on && !g_manager) return 0;
     for (i = 0; i < 3; ++i) { c->pos[i] = pos[i]; c->f[i] = fwd[i]; }
     l2 = c->f[0] * c->f[0] + c->f[1] * c->f[1] + c->f[2] * c->f[2];
     if (!(l2 > 0.25f && l2 < 4.0f)) return 0;          /* also rejects NaN */
@@ -656,15 +683,16 @@ static int make_frame(struct Frame *c)
         float inv = 1.0f / x_sqrtf(l2);
         for (i = 0; i < 3; ++i) c->f[i] *= inv;
     }
-    {
+    c->back = 0.0f; c->back2 = 0.0f; c->ahead = 0.0f; c->ahead2 = 0.0f; c->cos_full = 1.0f;
+    if (g_cone_on) {
         union { uint32_t u; float f; } v;
         v.u = rd32(g_manager + 0x1C);
         ahead = v.f;
+        c->back = g_back; c->back2 = g_back * g_back;
+        if (!(ahead > c->back + 1.0f) || ahead > 100000.0f) return 0;
+        c->ahead = ahead; c->ahead2 = ahead * ahead;
+        c->cos_full = g_cos_full;
     }
-    c->back = g_back; c->back2 = g_back * g_back;
-    if (!(ahead > c->back + 1.0f) || ahead > 100000.0f) return 0;
-    c->ahead = ahead; c->ahead2 = ahead * ahead;
-    c->cos_full = g_cos_full;
     c->use_pred = 0; c->burst = 0;
     us = os_now_us();
     if (g_prev_valid) {
@@ -714,32 +742,20 @@ static void park_drop_removed(const uint8_t *removals, uint32_t rcount)
 static void gu_x_on_reset_impl(uint8_t *gen)
 {
     (void)gen;
-    ++g_gu_extras_report.cone_resets;
-    g_gu_extras_report.cone_dropped_on_reset += g_park_count;
-    g_park_count = 0; g_cursor = 0; g_prev_valid = 0;
-    g_gu_extras_report.cone_parked_now = 0;
+    if (g_cone_on) {
+        ++g_gu_extras_report.cone_resets;
+        g_gu_extras_report.cone_dropped_on_reset += g_park_count;
+        g_park_count = 0; g_cursor = 0;
+        g_gu_extras_report.cone_parked_now = 0;
+    }
+    g_hold_count = 0; g_carried = 0; g_prev_valid = 0;
 }
 
-static void gu_x_before_queue_impl(uint8_t *gen)
+/* ConeBack: what lies outside the cone waits, what the cone reaches comes back */
+static uint32_t cone_step(uint8_t *queue, uint32_t count, uint32_t capacity,
+                          const struct Frame *fr, int ok)
 {
-    uint8_t *queue; uint32_t count, capacity, i, w, rcount;
-    const uint8_t *removals;
-    struct Frame fr;
-    int ok;
-    if (!gen || !g_park) return;
-    queue = rdptr(gen + 0x5224);
-    if (!queue) return;
-    count = rd16(gen + 0x5228);
-    capacity = rd32(gen + 0x5220);
-    if (capacity == 0 || capacity > 0x10000u || count > capacity) return;
-    ++g_gu_extras_report.cone_updates;
-    if (count > g_gu_extras_report.cone_queue_max) g_gu_extras_report.cone_queue_max = count;
-
-    removals = rdptr(gen + 0x522C);
-    rcount = rd16(gen + 0x5230);
-    if (rcount && removals && g_park_count) park_drop_removed(removals, rcount);
-
-    ok = make_frame(&fr);
+    uint32_t i, w;
     if (!ok) {
         /* no trustworthy camera: make everything that waits (as far as it fits) */
         ++g_gu_extras_report.cone_invalid_camera;
@@ -747,15 +763,14 @@ static void gu_x_before_queue_impl(uint8_t *gen)
             x_copy(queue + (size_t)count * 0x20u, g_park + (size_t)(g_park_count - 1u) * 0x20u, 0x20u);
             ++count; --g_park_count; ++g_gu_extras_report.cone_released_total;
         }
-        wr16(gen + 0x5228, count);
         g_gu_extras_report.cone_parked_now = g_park_count;
-        return;
+        return count;
     }
 
     /* new entries: in the cone they stay, outside they wait */
     for (i = 0, w = 0; i < count; ++i) {
         uint8_t *e = queue + (size_t)i * 0x20u;
-        if (in_cone(&fr, (const float *)e)) {
+        if (in_cone(fr, (const float *)e)) {
             if (w != i) x_copy(queue + (size_t)w * 0x20u, e, 0x20u);
             ++w; ++g_gu_extras_report.cone_made_directly;
         } else if (g_park_count < X_PARK_CAP) {
@@ -778,17 +793,17 @@ static void gu_x_before_queue_impl(uint8_t *gen)
             const float *q;
             if (idx >= n) idx -= n;
             q = (const float *)(g_park + (size_t)idx * 0x20u);
-            if (in_cone(&fr, q)) { g_cand_idx[ncand] = idx; g_cand_key[ncand] = dist2(&fr, q); ++ncand; }
+            if (in_cone(fr, q)) { g_cand_idx[ncand] = idx; g_cand_key[ncand] = dist2(fr, q); ++ncand; }
         }
         g_cursor = (start + k) % n;
         room = capacity - count;
         take = ncand;
-        if (!fr.burst && g_release != 0 && take > g_release) {
+        if (!fr->burst && g_release != 0 && take > g_release) {
             take = g_release; ++g_gu_extras_report.cone_budget_limited;
         }
         if (take > room) { take = room; ++g_gu_extras_report.cone_room_limited; }
         if (take > g_gu_extras_report.cone_max_released) g_gu_extras_report.cone_max_released = take;
-        if (fr.burst) ++g_gu_extras_report.cone_burst_updates;
+        if (fr->burst) ++g_gu_extras_report.cone_burst_updates;
         if (take) {
             sort_pairs(g_cand_key, g_cand_idx, ncand);               /* nearest first */
             for (k = 0; k < take; ++k) {
@@ -802,10 +817,112 @@ static void gu_x_before_queue_impl(uint8_t *gen)
             if (g_park_count) g_cursor %= g_park_count; else g_cursor = 0;
         }
     }
-    wr16(gen + 0x5228, count);
     g_gu_extras_report.cone_parked_now = g_park_count;
     if (g_park_count > g_gu_extras_report.cone_parked_max)
         g_gu_extras_report.cone_parked_max = g_park_count;
+    return count;
+}
+
+/* the first g_carried entries are the ones the after hook put back: drop those
+ * whose provider the game removed in the meantime */
+static uint32_t carried_drop_removed(uint8_t *queue, uint32_t count, const uint8_t *removals, uint32_t rcount)
+{
+    uint32_t carried = g_carried < count ? g_carried : count, i, w, j;
+    for (i = 0, w = 0; i < count; ++i) {
+        uint8_t *e = queue + (size_t)i * 0x20u;
+        if (i < carried) {
+            uint32_t p = rd32(e + 0x1C);
+            int gone = 0;
+            for (j = 0; j < rcount && !gone; ++j) gone = rd32(removals + (size_t)j * 8u) == p;
+            if (gone) { ++g_gu_extras_report.spawn_dropped_removed; continue; }
+        }
+        if (w != i) x_copy(queue + (size_t)w * 0x20u, e, 0x20u);
+        ++w;
+    }
+    return w;
+}
+
+/* spawn limit: only the nearest / in-view props (plus everything within
+ * spawn_near_always metres) are made now, the rest is kept for the next update */
+static uint32_t spawn_step(uint8_t *queue, uint32_t count, const struct Frame *fr, int ok)
+{
+    uint32_t i, taken = 0, rest = 0;
+    if (!ok || g_spawn_budget == 0 || count <= g_spawn_budget || count > X_SPAWN_MAX) return count;
+    for (i = 0; i < count; ++i) {
+        const float *q = (const float *)(queue + (size_t)i * 0x20u);
+        float dx = q[0] - fr->pos[0], dy = q[1] - fr->pos[1], dz = q[2] - fr->pos[2];
+        float d2 = dx * dx + dy * dy + dz * dz, w = 2.0f;
+        if (d2 != d2) d2 = 0.0f;                       /* NaN: make it now */
+        if (d2 > 1e-6f) {
+            float c = (dx * fr->f[0] + dy * fr->f[1] + dz * fr->f[2]) / x_sqrtf(d2);
+            if (c > 1.0f) c = 1.0f; else if (c < -1.0f) c = -1.0f;
+            w = 2.0f - c;                              /* ahead 1x, to the side 2x, behind 3x the distance */
+        }
+        g_sp_d2[i] = d2; g_sp_key[i] = d2 * w * w; g_sp_idx[i] = i;
+    }
+    sort_pairs_with(g_sp_key, g_sp_idx, count, g_sp_tk, g_sp_ti);
+    for (i = 0; i < count; ++i) {
+        uint32_t src = g_sp_idx[i];
+        const uint8_t *e = queue + (size_t)src * 0x20u;
+        if (i < g_spawn_budget || g_sp_d2[src] < g_spawn_near2) {
+            x_copy(g_scratch + (size_t)taken * 0x20u, e, 0x20u); ++taken;
+        } else {
+            x_copy(g_hold + (size_t)rest * 0x20u, e, 0x20u); ++rest;
+        }
+    }
+    x_copy(queue, g_scratch, taken * 0x20u);
+    g_hold_count = rest;
+    ++g_gu_extras_report.spawn_limited_updates;
+    g_gu_extras_report.spawn_held_total += rest;
+    if (rest > g_gu_extras_report.spawn_hold_max) g_gu_extras_report.spawn_hold_max = rest;
+    return taken;
+}
+
+static void gu_x_before_queue_impl(uint8_t *gen)
+{
+    uint8_t *queue; uint32_t count, capacity, rcount;
+    const uint8_t *removals;
+    struct Frame fr;
+    int ok;
+    int cone = g_cone_on && !g_cone_disabled, spawn = g_spawn_on && !g_spawn_disabled;
+    if (!gen) return;
+    queue = rdptr(gen + 0x5224);
+    if (!queue) return;
+    count = rd16(gen + 0x5228);
+    capacity = rd32(gen + 0x5220);
+    if (capacity == 0 || capacity > 0x10000u || count > capacity) return;
+    ++g_gu_extras_report.cone_updates;
+    if (count > g_gu_extras_report.cone_queue_max) g_gu_extras_report.cone_queue_max = count;
+
+    removals = rdptr(gen + 0x522C);
+    rcount = rd16(gen + 0x5230);
+    if (cone && rcount && removals && g_park_count) park_drop_removed(removals, rcount);
+    if (spawn) {
+        g_hold_count = 0;                              /* the after hook did not run last time: nothing to keep */
+        if (g_carried && rcount && removals) count = carried_drop_removed(queue, count, removals, rcount);
+        g_carried = 0;
+    }
+
+    ok = make_frame(&fr);
+    if (cone) count = cone_step(queue, count, capacity, &fr, ok);
+    if (spawn) count = spawn_step(queue, count, &fr, ok);
+    wr16(gen + 0x5228, count);
+}
+
+/* after the game has made its props: put the ones we kept back at the front of the queue */
+static void gu_x_after_queue_impl(uint8_t *gen)
+{
+    uint8_t *queue; uint32_t capacity, n;
+    if (!gen) return;
+    if (g_hold_count == 0) { g_carried = 0; return; }
+    queue = rdptr(gen + 0x5224);
+    capacity = rd32(gen + 0x5220);
+    if (!queue || capacity == 0 || capacity > 0x10000u) { g_hold_count = 0; g_carried = 0; return; }
+    n = g_hold_count < capacity ? g_hold_count : capacity;
+    x_copy(queue, g_hold, n * 0x20u);
+    wr16(gen + 0x5228, n);
+    g_carried = n;
+    g_hold_count = 0;
 }
 
 static void gu_x_cone_fault(void)
@@ -820,51 +937,180 @@ static void gu_x_cone_fault(void)
     g_gu_extras_report.cone_parked_now = 0;
 }
 
+static void gu_x_spawn_fault(void)
+{
+    /* what was kept for the next update is dropped: the generator re-queues what it still wants */
+    g_spawn_disabled = 1;
+    ++g_gu_extras_report.spawn_faults;
+    g_gu_extras_report.spawn_disabled = 1;
+    g_hold_count = 0; g_carried = 0;
+}
+
+static int queue_hooks_idle(void)
+{
+    return (!g_cone_on || g_cone_disabled) && (!g_spawn_on || g_spawn_disabled);
+}
+
 static void GU_X_CDECL gu_x_on_reset(uint8_t *gen)
 {
-    if (g_cone_disabled) return;
+    if (queue_hooks_idle()) return;
     GU_X_TRY { gu_x_on_reset_impl(gen); }
-    GU_X_EXCEPT { gu_x_cone_fault(); }
+    GU_X_EXCEPT { if (g_cone_on) gu_x_cone_fault(); if (g_spawn_on) gu_x_spawn_fault(); }
 }
 
 static void GU_X_CDECL gu_x_before_queue(uint8_t *gen)
 {
-    if (g_cone_disabled) return;
+    if (queue_hooks_idle()) return;
     GU_X_TRY { gu_x_before_queue_impl(gen); }
-    GU_X_EXCEPT { gu_x_cone_fault(); }
+    GU_X_EXCEPT { if (g_cone_on) gu_x_cone_fault(); if (g_spawn_on) gu_x_spawn_fault(); }
 }
 
-static uint32_t install_cone(const struct GuExtrasConfig *cfg,
-                             const uint8_t *image_base, uint32_t image_size,
-                             uint8_t *manager,
-                             int (*busy)(uint32_t, uint32_t, void *), void *ctx)
+static void GU_X_CDECL gu_x_after_queue(uint8_t *gen)
+{
+    if (!g_spawn_on || g_spawn_disabled) return;
+    GU_X_TRY { gu_x_after_queue_impl(gen); }
+    GU_X_EXCEPT { gu_x_spawn_fault(); }
+}
+
+/* ------------------------------------------------------------------ */
+/* feature 4: drawable references                                      */
+/* ------------------------------------------------------------------ */
+/* Every object with its model loaded holds one (20 bytes each, the game has
+ * 13000). When they run out the game takes models from other objects, and with
+ * many props trees, fences and cars flicker. The array is made once and never
+ * freed by the game, so only its size constant and its allocation are changed;
+ * the new array comes from our own memory. */
+static uint32_t g_orig_new_drawable;
+
+static void *GU_X_CDECL gu_x_drawable_alloc(uint32_t size)
+{
+    void *p = os_alloc_data(size);
+    if (p) { ++g_gu_extras_report.drawable_allocs; return p; }
+    ++g_gu_extras_report.drawable_alloc_fallbacks;
+    return ((void *(GU_X_CDECL *)(uint32_t))(uintptr_t)g_orig_new_drawable)(size);
+}
+
+static uint32_t install_drawable(const struct GuExtrasConfig *cfg,
+                                 const uint8_t *image_base, uint32_t image_size,
+                                 int (*busy)(uint32_t, uint32_t, void *), void *ctx)
 {
     struct Tx tx;
-    uint8_t *c1 = (uint8_t *)g_site[S_C1], *c3 = (uint8_t *)g_site[S_C3];
-    uint8_t *c4 = (uint8_t *)g_site[S_C4];
+    const uint8_t *d = g_site[S_D1];
+    uint32_t want = cfg->drawable_refs, old, init, call, st;
+    uint8_t buf[4];
+    if (want == 0) return GU_X_OFF;
+    if (!d) return GU_X_ERR_SITE;
+    if (d[0] != 0x68 || d[5] != 0xE8 || d[10] != 0xC3) return GU_X_ERR_SITE;
+    old = rd32(d + 1);
+    init = addr32(d + 5) + 5u + rd32(d + 6);               /* the function that makes the array */
+    if (!in_image(image_base, image_size, init, 0x1Du + 5u)) return GU_X_ERR_SITE;
+    if (*(const uint8_t *)(uintptr_t)(init + 0x1Cu) != 0x51 ||        /* push ecx (the size) */
+        *(const uint8_t *)(uintptr_t)(init + 0x1Du) != 0xE8) return GU_X_ERR_SITE;   /* call operator new */
+    if (old >= want) return GU_X_NOT_NEEDED;
+    call = init + 0x1Du;
+    g_orig_new_drawable = call + 5u + rd32((const uint8_t *)(uintptr_t)(call + 1u));
+    tx.n = 0;
+    wr32(buf, want);
+    if (!tx_add(&tx, (uint8_t *)(uintptr_t)(addr32(d) + 1u), buf, 4)) return GU_X_ERR_SITE;
+    if (cfg->drawable_own_memory) {   /* 0 = the array stays in the game's own heap (and is freed by it) */
+        wr32(buf, addr32((const void *)(uintptr_t)&gu_x_drawable_alloc) - (call + 5u));
+        if (!tx_add(&tx, (uint8_t *)(uintptr_t)(call + 1u), buf, 4)) return GU_X_ERR_SITE;
+    }
+    st = tx_commit(&tx, busy, ctx);
+    if (st == GU_X_ON) g_gu_extras_report.drawable_refs_applied = want;
+    return st;
+}
+
+/* ------------------------------------------------------------------ */
+/* feature 5: render cache                                             */
+/* ------------------------------------------------------------------ */
+/* The entities a frame draws go into one buffer of 8-byte entries (room for
+ * 9692). The sector scans stop taking entities once it holds 8192 (cmp ecx,
+ * 0x10000 in two places) and whatever they meet afterwards is not drawn that
+ * frame: looking at a whole district, cars, trees and the player vanish for
+ * frames. We give the game a bigger buffer (its start comes from one small
+ * "mov eax, imm32; ret" function) and move both limits to three quarters of it. */
+static void *g_render_cache_buffer;
+
+static uint32_t install_rendercache(const struct GuExtrasConfig *cfg,
+                                    const uint8_t *image_base, uint32_t image_size,
+                                    int (*busy)(uint32_t, uint32_t, void *), void *ctx)
+{
+    struct Tx tx;
+    const uint8_t *s0 = g_site[S_RC], *s1 = g_site2[S_RC];
+    uint32_t want = cfg->render_cache, d0, d1, limit, st;
+    uint8_t *start, *buffer, buf[4];
+    if (want == 0) return GU_X_OFF;
+    if (!s0 || !s1) return GU_X_ERR_SITE;
+    d0 = addr32(s0) + 5u + rd32(s0 + 1);
+    d1 = addr32(s1) + 5u + rd32(s1 + 1);
+    if (d0 != d1 || !in_image(image_base, image_size, d0, 6u)) return GU_X_ERR_SITE;
+    start = (uint8_t *)(uintptr_t)d0;
+    if (start[0] != 0xB8 || start[5] != 0xC3) return GU_X_ERR_SITE;   /* mov eax, imm32 ; ret */
+    if (rd32(s0 + 18) != 0x10000u || rd32(s1 + 18) != 0x10000u) return GU_X_ERR_SITE;
+    if (want < 9692u) return GU_X_NOT_NEEDED;
+    buffer = (uint8_t *)os_alloc_data(want * 8u + 64u);
+    if (!buffer) return GU_X_ERR_MEMORY;
+    limit = (want / 4u) * 3u * 8u;
+    tx.n = 0;
+    wr32(buf, addr32(buffer));
+    if (!tx_add(&tx, start + 1, buf, 4)) { os_free_data(buffer); return GU_X_ERR_SITE; }
+    wr32(buf, limit);
+    if (!tx_add(&tx, (uint8_t *)(uintptr_t)(addr32(s0) + 18u), buf, 4) ||
+        !tx_add(&tx, (uint8_t *)(uintptr_t)(addr32(s1) + 18u), buf, 4)) { os_free_data(buffer); return GU_X_ERR_SITE; }
+    st = tx_commit(&tx, busy, ctx);
+    if (st == GU_X_ON) { g_render_cache_buffer = buffer; g_gu_extras_report.render_cache_applied = want; }
+    else os_free_data(buffer);
+    return st;
+}
+
+static uint32_t install_queue_hooks(const struct GuExtrasConfig *cfg,
+                                    const uint8_t *image_base, uint32_t image_size,
+                                    uint8_t *manager, int want_cone, int want_spawn,
+                                    int (*busy)(uint32_t, uint32_t, void *), void *ctx)
+{
+    struct Tx tx;
+    uint8_t *c1 = (uint8_t *)g_site[S_C1], *c2 = (uint8_t *)g_site[S_C2];
+    uint8_t *c3 = (uint8_t *)g_site[S_C3], *c4 = (uint8_t *)g_site[S_C4];
     const uint8_t *cam = g_site[S_CAM];
-    uint8_t *s1, *s3, *s4, jump[16];
-    uint32_t cam_ptr, len, deg;
+    uint8_t *s1, *s2 = 0, *s3, *s4, jump[16];
+    uint32_t cam_ptr, len, deg, st;
     static const uint8_t reg_esi[1] = { 6 };
     static const uint8_t reg_ebp[1] = { 5 };
-    if (cfg->cone_back_meters == 0) return GU_X_OFF;
-    if (!c1 || !c3 || !c4 || !cam) return GU_X_ERR_SITE;
-    if (!manager) return GU_X_ERR_CONFIG;
+    if (!want_cone && !want_spawn) return GU_X_OFF;
+    if (!c1 || !c3 || !c4 || !cam || (want_spawn && !c2)) return GU_X_ERR_SITE;
+    if (want_cone && !manager) return GU_X_ERR_CONFIG;
     cam_ptr = rd32(cam + 12);
     if ((cam_ptr & 3u) != 0 || !in_image(image_base, image_size, cam_ptr - 32u, 44u))
         return GU_X_ERR_CAMERA;
-    if (!g_park) {
+    if (want_cone && !g_park) {
         g_park = (uint8_t *)os_alloc_data(X_PARK_CAP * 0x20u);
         if (!g_park) return GU_X_ERR_MEMORY;
     }
+    if (want_spawn && !g_hold) {
+        uint32_t rec = X_SPAWN_MAX * 0x20u, vec = X_SPAWN_MAX * 4u;
+        uint8_t *blk = (uint8_t *)os_alloc_data(2u * rec + 5u * vec);
+        if (!blk) return GU_X_ERR_MEMORY;
+        g_hold = blk; g_scratch = blk + rec;
+        g_sp_key = (float *)(blk + 2u * rec);
+        g_sp_d2 = (float *)(blk + 2u * rec + vec);
+        g_sp_tk = (float *)(blk + 2u * rec + 2u * vec);
+        g_sp_idx = (uint32_t *)(blk + 2u * rec + 3u * vec);
+        g_sp_ti = (uint32_t *)(blk + 2u * rec + 4u * vec);
+    }
     s1 = arena_take(); s3 = arena_take(); s4 = arena_take();
-    if (!s1 || !s3 || !s4) return GU_X_ERR_MEMORY;
+    if (want_spawn) s2 = arena_take();
+    if (!s1 || !s3 || !s4 || (want_spawn && !s2)) return GU_X_ERR_MEMORY;
     len = build_stub(s1, addr32((const void *)(uintptr_t)&gu_x_before_queue),
                      reg_esi, 1, 0, 1, 0, 0, c1, 11, addr32(c1) + 11u); (void)len;
     len = build_stub(s3, addr32((const void *)(uintptr_t)&gu_x_on_reset),
                      reg_ebp, 1, 0, 1, 0, 0, c3, 6, addr32(c3) + 6u); (void)len;
     len = build_stub(s4, addr32((const void *)(uintptr_t)&gu_x_on_reset),
                      reg_esi, 1, 0, 1, 0, 0, c4, 6, addr32(c4) + 6u); (void)len;
+    if (want_spawn) {
+        len = build_stub(s2, addr32((const void *)(uintptr_t)&gu_x_after_queue),
+                         reg_esi, 1, 0, 1, 0, 0, c2, 7, addr32(c2) + 7u); (void)len;
+    }
     tx.n = 0;
     make_jump(jump, 11, addr32(c1), addr32(s1));
     if (!tx_add(&tx, c1, jump, 11)) return GU_X_ERR_SITE;
@@ -872,6 +1118,10 @@ static uint32_t install_cone(const struct GuExtrasConfig *cfg,
     if (!tx_add(&tx, c3, jump, 6)) return GU_X_ERR_SITE;
     make_jump(jump, 6, addr32(c4), addr32(s4));
     if (!tx_add(&tx, c4, jump, 6)) return GU_X_ERR_SITE;
+    if (want_spawn) {
+        make_jump(jump, 7, addr32(c2), addr32(s2));
+        if (!tx_add(&tx, c2, jump, 7)) return GU_X_ERR_SITE;
+    }
 
     deg = cfg->cone_full_angle_deg;
     if (deg < 30u) deg = 30u;
@@ -883,12 +1133,15 @@ static uint32_t install_cone(const struct GuExtrasConfig *cfg,
     g_manager = manager;
     g_cam = (const float *)(uintptr_t)cam_ptr;
     g_park_count = 0; g_cursor = 0; g_prev_valid = 0;
-    g_cone_disabled = 0;
-    {
-        uint32_t st = tx_commit(&tx, busy, ctx);
-        if (st != GU_X_ON) g_cam = 0;
-        return st;
-    }
+    g_hold_count = 0; g_carried = 0;
+    g_spawn_budget = cfg->spawns_per_update;
+    g_spawn_near2 = (float)cfg->spawn_near_always * (float)cfg->spawn_near_always;
+    g_cone_disabled = 0; g_spawn_disabled = 0;
+    g_gu_extras_report.cone_disabled = 0; g_gu_extras_report.spawn_disabled = 0;
+    g_cone_on = want_cone; g_spawn_on = want_spawn;
+    st = tx_commit(&tx, busy, ctx);
+    if (st != GU_X_ON) { g_cam = 0; g_cone_on = 0; g_spawn_on = 0; }
+    return st;
 }
 
 /* ------------------------------------------------------------------ */
@@ -900,16 +1153,22 @@ static int install_core(const struct GuExtrasConfig *cfg,
                         int (*busy)(uint32_t, uint32_t, void *), void *ctx)
 {
     uint32_t need = 0, i;
-    int matrix_req, refl_req, cone_req, installed = 0;
+    int matrix_req, refl_req, cone_req, drawable_req, cache_req, spawn_req, installed = 0;
     struct GuExtrasReport *r = &g_gu_extras_report;
-    for (i = 0; i < S_COUNT; ++i) { g_site[i] = 0; r->site_name[i] = k_site_name[i]; }
+    for (i = 0; i < S_COUNT; ++i) { g_site[i] = 0; g_site2[i] = 0; r->site_name[i] = k_site_name[i]; }
     r->sites_known = S_COUNT;
     matrix_req = cfg->matrix_limit > X_MATRIX_VANILLA_LIMIT || cfg->matrix_pool != 0;
     refl_req = cfg->reflections_props == 0;
     cone_req = cfg->cone_back_meters != 0;
+    drawable_req = cfg->drawable_refs != 0;
+    cache_req = cfg->render_cache != 0;
+    spawn_req = cfg->spawns_per_update != 0;
     if (matrix_req) need |= BIT(S_M1) | BIT(S_M2) | BIT(S_M3) | BIT(S_M4) | BIT(S_M5);
     if (refl_req) need |= BIT(S_R0) | BIT(S_RA) | BIT(S_RB);
-    if (cone_req) need |= BIT(S_C1) | BIT(S_C3) | BIT(S_C4) | BIT(S_CAM);
+    if (cone_req || spawn_req) need |= BIT(S_C1) | BIT(S_C3) | BIT(S_C4) | BIT(S_CAM);
+    if (spawn_req) need |= BIT(S_C2);
+    if (drawable_req) need |= BIT(S_D1);
+    if (cache_req) need |= BIT(S_RC);
     if (!need) return 0;
     /* the pool pieces are only needed when the pool changes; resolve them all
      * and let each feature decide, but report what was found */
@@ -923,9 +1182,18 @@ static int install_core(const struct GuExtrasConfig *cfg,
         r->reflections_status = install_reflections(cfg, image_base, image_size, busy, ctx);
         if (r->reflections_status == GU_X_ON) installed |= 2;
     }
-    if (cone_req) {
-        r->cone_status = install_cone(cfg, image_base, image_size, manager, busy, ctx);
-        if (r->cone_status == GU_X_ON) installed |= 4;
+    if (cone_req || spawn_req) {
+        uint32_t st = install_queue_hooks(cfg, image_base, image_size, manager, cone_req, spawn_req, busy, ctx);
+        if (cone_req) { r->cone_status = st; if (st == GU_X_ON) installed |= 4; }
+        if (spawn_req) { r->spawn_status = st; if (st == GU_X_ON) installed |= 32; }
+    }
+    if (drawable_req) {
+        r->drawable_status = install_drawable(cfg, image_base, image_size, busy, ctx);
+        if (r->drawable_status == GU_X_ON) installed |= 8;
+    }
+    if (cache_req) {
+        r->render_cache_status = install_rendercache(cfg, image_base, image_size, busy, ctx);
+        if (r->render_cache_status == GU_X_ON) installed |= 16;
     }
     return installed;
 }
