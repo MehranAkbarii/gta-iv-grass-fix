@@ -86,7 +86,7 @@ The Safe Balanced Edition uses:
   ------------------------------ ---------------
   Procedural Pool                        `16384`
   Procedural Pool hard ceiling           `16384`
-  Rendered Object Pool                    `8192`
+  Rendered Object Pool                    `16384`
   Rendered Object hard ceiling            `8192`
   Source Buffer                           `8192`
   Source Bank                             `8192`
