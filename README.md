@@ -149,14 +149,14 @@ The Safe Balanced Edition therefore increases the procedural
 draw-distance multiplier to:
 
 ```
-Configured DistanceMultiplier: 1.25
-Effective runtime ceiling: 1.50
+Configured DistanceMultiplier: 1.00
+Effective runtime ceiling: 3.00
 ```
 
 This provides a visible improvement while avoiding extreme distance
 multipliers.
 
-## Why 1.25x instead of a much larger value?
+## Why 1.00x instead of a much larger value?
 
 Very large distance multipliers can multiply the number of objects that
 need to be considered by the streaming system.
@@ -505,6 +505,15 @@ overhaul.
    It cannot be proven that pop-in is never visible without playing: a very
    fast flick can still show some props appearing. Raise ConeFullAngle (90-110)
    or ConeBack, or lower ConeBack to 0 to switch it off.
+   
+4. Drawable references
+Every object whose model is loaded holds one (the game has 13000, 20 bytes each). When they run out the game takes the model from another object: with many props, trees, fences and cars flicker.
+
+5. Spawn limit
+at most this many props are made in one generator update; the rest wait for the next updates, the nearest and the ones in view first. Props within SpawnNearAlways metres are always made at once. 0 = off, else 16..8192. It smooths the work, it does not make anything faster: the same props still have to be made, only over more frames
+
+6. Render cache
+how many entities a frame can draw. The game has room for 9692 and stops taking entities at 8192 the rest is not drawn that frame, so when you look over a whole district cars, trees and the player vanish for frames.
 
 --------------------------------------------------------
 # 19. Configuration Summary
