@@ -521,17 +521,20 @@ how many entities a frame can draw. The game has room for 9692 and stops taking 
 The Safe Balanced baseline is approximately:
 ```ini
 [ProceduralPool]
-; Conservative stability-oriented preset.
-; Fixed capacities avoid the more aggressive automatic pool expansion.
+
 Capacity=16384
 RenderedObjectCapacity=8192
 ProviderCapacity=40
 
-; 1.25x procedural-object distance: visible improvement without the
-; aggressive 2x-4x ranges that can amplify streaming pressure.
-DistanceMultiplier=1.25
+; Allowed 0.5 .. 3.0
+; Default value is 1.0
+; Anything above 1.0 can cause instabilities and micro stutters
+; Anything above 2.0 is experimental 
+; For anything above 1.25 read the tier table at the end of this file: the
+; pools below have to grow with the distance.
+DistanceMultiplier=1.00
 
-; Keep density neutral. Distance is increased, density is not.
+; Keep density neutral to avoid micro stutters
 PlantDensityMultiplier=1.0
 ProceduralObjectDensityMultiplier=1.0
 DensityClassMask=3
@@ -544,23 +547,54 @@ HangMessageBox=0
 FullHangDump=0
 
 ; ---------------------------------------------------------------------------
-; Optional extras.
-; Each feature installs only if all of its byte patterns match exactly once in
-; GTAIV.exe; otherwise it stays off and the log ([EXTRAS]) says why.
+; Optional Extras.
 ; ---------------------------------------------------------------------------
 
-; More props can be scaled and slope-aligned (the game allows 512). 0 = off.
-; Allowed 513..4096. The matrix pool is raised automatically with it.
-GeneratorMatrixLimit=4096
-; Matrix pool size. 0 = automatic (28000 when the limit is on). 7000..65536.
+; Matrix pool for generated props. The game keeps the matrices of scaled and
+; slope-aligned props in a pool of 7000 that is shared with other objects (cars,
+; trees). The main fix already lets up to RenderedObjectCapacity props use one,
+; but does not raise the pool.
+;   0     = OFF (the game's 7000 stays), UNLESS GeneratorMatrixLimit below is set
+;           above 512: then the pool becomes automatic = 28000.
+;   7000..65536 = this many. The pool is allocated outside the game heap
+;           (28000 = about 2.2 MB, 40000 = about 3.2 MB).
 GeneratorMatrixPool=0
+; The two "512" instructions behind that limit are already raised by the main
+; fix. This key only does something if they are still original (for example
+; with RenderedObjectCapacity=512). 0 = off, else 513..4096.
+GeneratorMatrixLimit=4096
+
+; Drawable references. Every object whose model is loaded holds one (the game
+; has 13000, 20 bytes each). When they run out the game takes the model from
+; another object: with many props, trees, fences and cars flicker.
+; 0 = off, else 13000..200000. 100000 = about 2 MB, taken outside the game heap.
+DrawableRefs=100000
+; Where the bigger array lives. 
+; 0 = in the game's own heap, so the game frees it itself.
+; 1 = in memory of our own 
+; Keep it on 0 if the game complains about memory when it closes.
+DrawableRefsOwnMemory=0
+
+; Render cache: how many entities a frame can draw. The game has room for 9692
+; and stops taking entities at 8192; the rest is not drawn that frame, so when
+; you look over a whole district cars, trees and the player vanish for frames.
+; 0 = off, else 9692..1048576. 32768 = about 256 KB.
+RenderCache=32768
+
+; Spawn limit: at most this many props are made in one generator update; the
+; rest wait for the next updates, the nearest and the ones in view first. Props
+; within SpawnNearAlways metres are always made at once. 0 = off, else 16..8192.
+; It smooths the work, it does not make anything faster: the same props still
+; have to be made, only over more frames
+SpawnsPerUpdate=1024
+SpawnNearAlways=50
 
 ; 1 = props are drawn in water reflections (vanilla). 0 = they are not.
 PropsInWaterReflections=1
 
 ; ConeBack: props behind the camera wait instead of being made, and come back
 ; (nearest first) before the camera turns to them. Value = metres that are
-; always made in every direction. 0 = off. Allowed 20..1000.
+; always made in every direction. 0 = off. Allowed 20..1000. Try 70.
 ConeBack=70
 ; Half angle (degrees) inside which the full distance applies. A larger value
 ; makes fewer props wait and hides pop-in better. 30..120.
